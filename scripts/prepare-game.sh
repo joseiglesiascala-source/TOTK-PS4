@@ -40,7 +40,8 @@ if has import; then
     shopt -u nullglob nocaseglob
     [ ${#games[@]} -gt 0 ] || { echo "no .xci / .nsp in $IN" >&2; exit 1; }
     keys=("$IN/prod.keys"); [ -f "$IN/title.keys" ] && keys+=("$IN/title.keys")
-    private/build/importer/nximport --title "$TITLE" --exefs --out "$G" "${keys[@]}" "${games[@]}"
+    NX_IMPORT_NOSYNC=1 private/build/importer/nximport --title "$TITLE" --exefs --out "$G" "${keys[@]}" "${games[@]}"
+    sync
     ls -la "$G/analysis"
 fi
 
@@ -86,17 +87,17 @@ if has shaders; then
     H="private/build/spirv_harness/bin/Release/net10.0/spirv_harness.dll"
     P="$VENV/bin/python"; X=tools/maxwell/containers.py; O="$G/shaders_extracted"; R="$G/extract/romfs"
     mkdir -p "$O"
-    # Tears of the Kingdom's shaders: everything under Shader/ and Lib/ (TextureShader.bnsh, agl/gsys), the boot pack
-    # (Pack/Bootup.Nin_NX_NVN.pack.zs, as MacNativeGames' seed: 9,360 unique there for 1.0.0), and the effect and
-    # layout files. The PS4 has no translator at run time, so this set must be complete. Most files are zstd with the
-    # dictionaries in Pack/ZsDic.pack.zs (containers.py reads them). Files without shaders extract nothing and their
-    # folder is removed.
+    # Tears of the Kingdom's shaders (1.0.0, checked): the shader archives in Shader/ (FSHA), Lib/ (TextureShader.bnsh
+    # and the agl, gsys and terrain packs: 8,575 stages), the effects (1,563 of 1,577 Effect/*.esetb.byml.zs carry
+    # their own BNSH) and the UI layouts (UI/LayoutArchive/*.blarc.zs). The boot pack holds no shaders. The PS4 has
+    # no translator at run time, so this set must be complete. Most files are zstd with the dictionaries in
+    # Pack/ZsDic.pack.zs (containers.py reads them). Files without shaders extract nothing and their folder is removed.
     while IFS= read -r -d '' f; do
         rel="${f#"$R"/}"
         n="$(printf '%s' "$rel" | sed 's#[/ ]#_#g; s#\.zs$##')"
         "$P" $X "$f" --extract "$O/$n" --unique >/dev/null 2>&1 || true
         [ -n "$(ls -A "$O/$n" 2>/dev/null | grep -v manifest.tsv)" ] || rm -rf "$O/$n"
-    done < <(find "$R/Shader" "$R/Lib" "$R/Effect" "$R/Layout" "$R/Pack/Bootup.Nin_NX_NVN.pack.zs" -type f -print0 \
+    done < <(find "$R/Shader" "$R/Lib" "$R/Effect" "$R/UI/LayoutArchive" -type f -print0 \
                   2>/dev/null)
     "$P" tools/maxwell/exefs_shaders.py "$G/analysis/main.bin" --extract "$O/exefs"
     echo "$(ls "$O" | wc -l) shader containers extracted"

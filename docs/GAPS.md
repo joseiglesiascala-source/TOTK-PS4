@@ -16,12 +16,19 @@ not read in code but concluded.
   - TOTK's sun-visibility kernel lost its `atomicMin` that way.
 - zstd dictionaries (`Pack/ZsDic.pack.zs`) in `tools/maxwell/containers.py`, with the Python `zstandard` module only.
 
+## Checked on the 1.0.0 dump (2026-10-18)
+
+- **Sizes.** main is 70 MiB, sdk 13 MiB, subsdk0 5.6 MiB. All have DT_INIT at +0x30 and no RELR.
+- **Relocations.** main has 503,796 RELA and 640 JMPREL entries.
+- **SystemResourceSize.** 0x1800000 (24 MiB) from main.npdm. Mac uses 32 MiB.
+- **Audio.** The sdk has `AudioRenderSystem::Update`, `CommandListProcessor::Process` and
+  `CreateAudioRendererManagerByDfc`, so the recomp's in-process audio path (Wonder's) should apply.
+- **Entry point.** The sdk has SDK 16's `nn::init::Start` with three callbacks.
+- **RomFS.** 304,207 files in 2,664 folders, 17.04 GB.
+
 ## To check at the first boot
 
 - **Constructor order.** The recomp runs DT_INIT sdk → subsdk0 → main. Mac's notes say main → subsdk0 → sdk.
-- **DT_INIT location.** `main.cpp` assumes DT_INIT at +0x30. Mac reads DT_DYNAMIC tag 12.
-- **Audio.** The recomp wraps the SDK's in-process `AudioRenderSystem::Update` (Wonder). If TOTK's sdk doesn't
-  export it, an `audren:u` server is needed (Mac has one: `runtime/audio_renderer.c`).
 - **Memory accounting.**
   - TOTK's allocators use the alias region (64 GiB at 0x70_0000_0000 on Mac).
   - GetInfo 7/22 should count mapped alias pages.

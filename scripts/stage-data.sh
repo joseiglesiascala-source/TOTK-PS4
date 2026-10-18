@@ -2,7 +2,7 @@
 # Lays out the game data the PS4 runtime reads from /data/TOTK (scripts/prepare-game.sh's output, your own dump):
 #
 #   analysis/{main,subsdk0,sdk}.bin, main.npdm   the modules as loaded, the program metadata
-#   extract/romfs/...                     the RomFS (about 16 GB)
+#   romfs.pak, romfs.idx                  the RomFS (17 GB, scripts/make-romfs-pack.py; or extract/romfs/...)
 #   spirv/<hash>.spv, spirv/results.tsv   the translated shaders and the translator's records
 #   config.txt                            NX_* switches (written if missing; see README.md)
 #
@@ -18,15 +18,25 @@ for f in analysis/main.bin analysis/subsdk0.bin analysis/sdk.bin analysis/main.n
     [ -f "$G/$f" ] || { echo "missing $G/$f (scripts/prepare-game.sh)" >&2; exit 1; }
 done
 [ -d "$G/extract/romfs" ] || { echo "missing $G/extract/romfs" >&2; exit 1; }
-mkdir -p "$OUT/analysis" "$OUT/spirv" "$OUT/extract"
+mkdir -p "$OUT/analysis" "$OUT/spirv"
 link() { ln -f "$1" "$2" 2>/dev/null || cp -f "$1" "$2"; }
 link "$G/analysis/main.bin" "$OUT/analysis/main.bin"
 for f in subsdk0.bin sdk.bin main.npdm; do link "$G/analysis/$f" "$OUT/analysis/$f"; done
 link "$G/spirv/results.tsv" "$OUT/spirv/results.tsv"
 find "$G/spirv" -maxdepth 1 -name '*.spv' -exec ln -f -t "$OUT/spirv" {} + 2>/dev/null ||
     find "$G/spirv" -maxdepth 1 -name '*.spv' -exec cp -f -t "$OUT/spirv" {} +
-rm -rf "$OUT/extract/romfs"
-cp -al "$G/extract/romfs" "$OUT/extract/romfs" 2>/dev/null || cp -a "$G/extract/romfs" "$OUT/extract/romfs"
+# The RomFS as romfs.pak + romfs.idx (scripts/make-romfs-pack.py: two files to upload instead of 304,207), made once
+# (TOTK_REPACK=1 makes it again). TOTK_ROMFS_FOLDER=1 stages the extract/romfs folder instead.
+if [ "${TOTK_ROMFS_FOLDER:-0}" = 1 ]; then
+    rm -f "$OUT/romfs.pak" "$OUT/romfs.idx"
+    rm -rf "$OUT/extract/romfs"; mkdir -p "$OUT/extract"
+    cp -al "$G/extract/romfs" "$OUT/extract/romfs" 2>/dev/null || cp -a "$G/extract/romfs" "$OUT/extract/romfs"
+else
+    rm -rf "$OUT/extract"
+    if [ "${TOTK_REPACK:-0}" = 1 ] || [ ! -f "$OUT/romfs.idx" ] || [ ! -f "$OUT/romfs.pak" ]; then
+        python3 "$(dirname "$0")/make-romfs-pack.py" "$G/extract/romfs" "$OUT"
+    fi
+fi
 if [ ! -f "$OUT/config.txt" ]; then
     cat > "$OUT/config.txt" <<'EOF'
 # TOTK settings: one NX_<KEY>=<value> per line, read at startup ('#' comments). See README.md.
