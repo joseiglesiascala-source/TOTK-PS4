@@ -183,6 +183,68 @@ index 0000000..3220827
 @@ -0,0 +1,2 @@
 +# Tears of the Kingdom ships three code modules (ExeFS: main, subsdk0, sdk), in rtld order.
 +set(NX_GAME_MODULES main subsdk0 sdk)
+diff --git a/recomp/__main__.py b/recomp/__main__.py
+index 73bb101..5f95b44 100644
+--- a/recomp/__main__.py
++++ b/recomp/__main__.py
+@@ -47,6 +47,9 @@ def main():
+     ap.add_argument("--name", default="main")
+     ap.add_argument("--base", default="0x4000000000")
+     ap.add_argument("--only", nargs="*", default=None, help="only these function addresses (debug)")
++    ap.add_argument("--trace", default=None,
++                    help="file of function addresses (hex, one per line, '#' comments) whose entry and return the runtime "
++                         "logs (nx::guest_trace); only the files holding them change")
+     args = ap.parse_args()
+     base = int(args.base, 0)
+     name = args.name
+@@ -58,6 +61,12 @@ def main():
+ 
+     os.makedirs(args.out, exist_ok=True)
+     e = emit.Emitter(an, prefix=name)
++    if args.trace and os.path.exists(args.trace):
++        for line in open(args.trace):
++            line = line.split("#")[0].strip()
++            if line:
++                e.trace.add(int(line, 16))
++        print(f"tracing {len(e.trace)} functions")
+     funcs = an.functions
+     if args.only:
+         want = {int(x, 16) for x in args.only}
+diff --git a/recomp/emit.py b/recomp/emit.py
+index 61030bc..b80cab1 100644
+--- a/recomp/emit.py
++++ b/recomp/emit.py
+@@ -121,6 +121,7 @@ from .emit_neon_wide import NeonWideOps  # noqa: E402
+ 
+ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+     def __init__(self, an, prefix="sub"):
++        self.trace = set()  # function starts to wrap with nx::guest_trace (--trace)
+         self.an = an
+         self.m = an.module
+         self.cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+@@ -251,7 +252,11 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+                 stmt += f" nx::trace_sp(c, {B} + {a:#x}ull);"
+             body.append((a, f"{stmt} // {i.mnemonic} {i.op_str}"))
+             last_term = i.mnemonic in ("b", "br", "ret", "udf", "brk") or stmt.endswith("return; }")
+-        out = [f"void {self.fn(f.start)}(nx::CPU& NX_RESTRICT c) {{"]
++        traced = f.start in self.trace
++        name = self.fn(f.start) + ("_body" if traced else "")
++        out = [f"{'static ' if traced else ''}void {name}(nx::CPU& NX_RESTRICT c) {{"]
++        if traced:  # declared here, not in nx/cpu.h: only the files holding traced functions change
++            out.insert(0, "namespace nx { void guest_trace(CPU& c, uint64_t addr, int exit); }")
+         sj = self.setjmp_sites
+         if sj:
+             # Functions that call setjmp run inside a try: a longjmp on one of their buffers resumes after the call.
+@@ -276,6 +281,9 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+             out.append("        js_[jr_].restore(c); c.x[0] = e_.val ? e_.val : 1;")
+             out.append("    } }")
+         out.append("}")
++        if traced:  # --trace: entry (x0..x3, lr) and return (x0) logged by the runtime
++            out.append(f"void {self.fn(f.start)}(nx::CPU& NX_RESTRICT c) {{ nx::guest_trace(c, {B} + {f.start:#x}ull, 0); "
++                       f"{name}(c); nx::guest_trace(c, {B} + {f.start:#x}ull, 1); }}")
+         return "\n".join(out)
+ 
+     # ---- instruction dispatch -----------------------------------------------------------------------------
 diff --git a/recomp/nso.py b/recomp/nso.py
 index 5df6158..1adfd41 100644
 --- a/recomp/nso.py
@@ -761,10 +823,18 @@ index e5d47f2..4098c7b 100644
              last = f;
              since = now;
 diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
-index be9efae..c05e1d9 100644
+index be9efae..660f810 100644
 --- a/runtime/src/loader.cpp
 +++ b/runtime/src/loader.cpp
-@@ -52,7 +52,7 @@ void log(const char* fmt, ...) {
+@@ -3,6 +3,7 @@
+ #include <cstdarg>
+ #include <cstdio>
+ #include <fstream>
++#include <map>
+ #include <mutex>
+ #include <string>
+ #include <unordered_map>
+@@ -52,7 +53,7 @@ void log(const char* fmt, ...) {
      std::lock_guard lk(g_log_lock);
      if (!g_log_file) {
          const char* path = std::getenv("NX_LOG");
@@ -773,6 +843,32 @@ index be9efae..c05e1d9 100644
          std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
  #else
          std::string def = plat::data_root() + "/../nx.log";
+@@ -281,3 +282,25 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
+ }
+ 
+ }  // namespace nx
++
++namespace nx {
++
++// --trace (recomp/__main__.py): entry and return of chosen guest functions, the first 400 of each, then every 1000th.
++void guest_trace(CPU& c, uint64_t addr, int exit) {
++    static std::mutex m;
++    static std::map<uint64_t, uint64_t> counts;
++    uint64_t n;
++    {
++        std::lock_guard lk(m);
++        n = exit ? counts[addr] : ++counts[addr];
++    }
++    if (n > 400 && n % 1000) return;
++    if (!exit)
++        log("trace > %s #%llu (%llx, %llx, %llx, %llx) lr %s", describe(addr).c_str(), (unsigned long long)n,
++            (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2],
++            (unsigned long long)c.x[3], describe(c.x[30]).c_str());
++    else
++        log("trace < %s #%llu = %llx", describe(addr).c_str(), (unsigned long long)n, (unsigned long long)c.x[0]);
++}
++
++}  // namespace nx
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
 index ee2a825..23bb143 100644
 --- a/runtime/src/main.cpp

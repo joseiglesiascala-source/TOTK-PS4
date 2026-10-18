@@ -65,7 +65,9 @@ EOF
 )
         printf '%-8s %d MiB at %s\n' "$mod" $((size >> 20)) "${BASE[$mod]}"
         [ "$size" -le $((ROOM[$mod])) ] || { echo "$mod is $size bytes: more than the $((ROOM[$mod] >> 20)) MiB it has" >&2; exit 1; }
-        "$VENV/bin/python" -m recomp "$G/exefs/$mod" "$G/gen/$mod" --name "$mod" --base "${BASE[$mod]}"
+        # private/totk/trace-<module>.txt (hex function addresses): those functions log entry and return (diagnostics)
+        trace=(); [ -f "$G/trace-$mod.txt" ] && trace=(--trace "$G/trace-$mod.txt")
+        "$VENV/bin/python" -m recomp "$G/exefs/$mod" "$G/gen/$mod" --name "$mod" --base "${BASE[$mod]}" "${trace[@]}"
     done
     du -sh "$G/gen"/*
 fi
