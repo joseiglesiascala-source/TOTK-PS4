@@ -26,6 +26,8 @@ TOTK is a port. Nearly everything that will make the game run is other people's 
   **[M33](https://github.com/iHaiDeeZ/M33)**, **[Crema](https://github.com/iHaiDeeZ/Crema)** and
   **[SMW](https://github.com/iHaiDeeZ/SMW)** by ShiroKlein:
   the PS4 runtime in `port/` (heap, crash and hang logs, thread placement) and the VideoOut presentation.
+- **stb_dxt** by Fabian Giesen and Sean Barrett (public domain / MIT): the BC3 encoder the game's ASTC textures
+  are re-packed with (`runtime/src/nvn/stb_dxt.h` in `patches/totk-ps4.patch`).
 - **dlmalloc** by Doug Lea (its MIT-style licence, at the top of `port/third_party/dlmalloc/malloc.c`).
 - **libjpeg-turbo** (BSD-3-Clause): the `turbojpeg.h` header in `port/third_party/turbojpeg`, with its notice.
 
