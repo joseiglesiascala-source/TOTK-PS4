@@ -211,7 +211,7 @@ index 73bb101..5f95b44 100644
      if args.only:
          want = {int(x, 16) for x in args.only}
 diff --git a/recomp/emit.py b/recomp/emit.py
-index 61030bc..b80cab1 100644
+index 61030bc..70db682 100644
 --- a/recomp/emit.py
 +++ b/recomp/emit.py
 @@ -121,6 +121,7 @@ from .emit_neon_wide import NeonWideOps  # noqa: E402
@@ -222,20 +222,33 @@ index 61030bc..b80cab1 100644
          self.an = an
          self.m = an.module
          self.cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
-@@ -251,7 +252,11 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+@@ -233,6 +234,7 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+             insns[a] = got[0] if got else None
+         jt = self.an.jump_tables
+         last_term = False
++        needs_trace_decl = False
+         for a in range(f.start, f.end, 4):
+             i = insns[a]
+             if i is None:
+@@ -249,9 +251,16 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+                 stmt = f"nx::unimpl(c, {B} + {a:#x}ull, \"{txt}\"); // {e}"
+             if f.start in self.trace_sp and ("sp" in i.op_str.split(",")[0] or "[sp" in i.op_str and i.writeback):
                  stmt += f" nx::trace_sp(c, {B} + {a:#x}ull);"
++            if a in self.trace and a != f.start:  # --trace with an address inside a function: x0..x3 there
++                stmt = f"nx::guest_trace(c, {B} + {a:#x}ull, 2); " + stmt
++                needs_trace_decl = True
              body.append((a, f"{stmt} // {i.mnemonic} {i.op_str}"))
              last_term = i.mnemonic in ("b", "br", "ret", "udf", "brk") or stmt.endswith("return; }")
 -        out = [f"void {self.fn(f.start)}(nx::CPU& NX_RESTRICT c) {{"]
 +        traced = f.start in self.trace
 +        name = self.fn(f.start) + ("_body" if traced else "")
 +        out = [f"{'static ' if traced else ''}void {name}(nx::CPU& NX_RESTRICT c) {{"]
-+        if traced:  # declared here, not in nx/cpu.h: only the files holding traced functions change
++        if traced or needs_trace_decl:  # declared here, not in nx/cpu.h: only files holding traced code change
 +            out.insert(0, "namespace nx { void guest_trace(CPU& c, uint64_t addr, int exit); }")
          sj = self.setjmp_sites
          if sj:
              # Functions that call setjmp run inside a try: a longjmp on one of their buffers resumes after the call.
-@@ -276,6 +281,9 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+@@ -276,6 +285,9 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
              out.append("        js_[jr_].restore(c); c.x[0] = e_.val ? e_.val : 1;")
              out.append("    } }")
          out.append("}")
@@ -823,7 +836,7 @@ index e5d47f2..4098c7b 100644
              last = f;
              since = now;
 diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
-index be9efae..660f810 100644
+index be9efae..1cc3c6d 100644
 --- a/runtime/src/loader.cpp
 +++ b/runtime/src/loader.cpp
 @@ -3,6 +3,7 @@
@@ -843,24 +856,31 @@ index be9efae..660f810 100644
          std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
  #else
          std::string def = plat::data_root() + "/../nx.log";
-@@ -281,3 +282,25 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
+@@ -281,3 +282,32 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
  }
  
  }  // namespace nx
 +
 +namespace nx {
 +
-+// --trace (recomp/__main__.py): entry and return of chosen guest functions, the first 400 of each, then every 1000th.
++// --trace (recomp/__main__.py): entry (exit 0) and return (1) of chosen guest functions, or an instruction inside one
++// (2: the registers there); the first 3000 of each, then every 1000th.
 +void guest_trace(CPU& c, uint64_t addr, int exit) {
 +    static std::mutex m;
 +    static std::map<uint64_t, uint64_t> counts;
 +    uint64_t n;
 +    {
 +        std::lock_guard lk(m);
-+        n = exit ? counts[addr] : ++counts[addr];
++        n = exit == 1 ? counts[addr] : ++counts[addr];
 +    }
-+    if (n > 400 && n % 1000) return;
-+    if (!exit)
++    if (n > 3000 && n % 1000) return;
++    if (exit == 2)
++        log("trace @ %s #%llu x0 %llx x1 %llx x2 %llx x3 %llx x8 %llx x19 %llx x20 %llx x25 %llx x26 %llx",
++            describe(addr).c_str(), (unsigned long long)n, (unsigned long long)c.x[0], (unsigned long long)c.x[1],
++            (unsigned long long)c.x[2], (unsigned long long)c.x[3], (unsigned long long)c.x[8],
++            (unsigned long long)c.x[19], (unsigned long long)c.x[20], (unsigned long long)c.x[25],
++            (unsigned long long)c.x[26]);
++    else if (!exit)
 +        log("trace > %s #%llu (%llx, %llx, %llx, %llx) lr %s", describe(addr).c_str(), (unsigned long long)n,
 +            (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2],
 +            (unsigned long long)c.x[3], describe(c.x[30]).c_str());
@@ -2412,10 +2432,19 @@ index 2304437..1098b51 100644
  }
  
 diff --git a/runtime/src/nvn/nvn_texture_layout.cpp b/runtime/src/nvn/nvn_texture_layout.cpp
-index 99383fc..dcf1024 100644
+index 99383fc..2788b14 100644
 --- a/runtime/src/nvn/nvn_texture_layout.cpp
 +++ b/runtime/src/nvn/nvn_texture_layout.cpp
-@@ -82,6 +82,42 @@ Layout compute(CPU& c, uint64_t builder) {
+@@ -79,9 +79,51 @@ Layout compute(CPU& c, uint64_t builder) {
+     layer = (layer + block - 1) / block * block;
+     l.size = layer * depth * samples;
+     l.alignment = block;
++    if (l.size >= (32ull << 20)) {  // the big ones (Tears of the Kingdom's MaterialAlb array): checked against the game's
++        static std::atomic<int> logged{0};
++        if (logged++ < 40)
++            log("nvn: storage size %llu (layer %llu, block height %u GOBs) for %ux%ux%u, %u levels, format %#x, %u samples",
++                (unsigned long long)l.size, (unsigned long long)layer, bh0, width, height, depth, levels, format, samples);
++    }
      return l;
  }
  
@@ -2458,7 +2487,7 @@ index 99383fc..dcf1024 100644
  void GetStorageSize(CPU& c) { c.x[0] = compute(c, c.x[0]).size; }            // size_t (const NVNtextureBuilder*)
  void GetStorageAlignment(CPU& c) { c.x[0] = compute(c, c.x[0]).alignment; }  // size_t (const NVNtextureBuilder*)
  void GetStorageClass(CPU& c) { c.x[0] = 0; }  // NVNstorageClass: only matters for compression / sparse tiles
-@@ -96,6 +132,7 @@ void format_block(uint32_t format, uint32_t& block_w, uint32_t& block_h, uint32_
+@@ -96,6 +138,7 @@ void format_block(uint32_t format, uint32_t& block_w, uint32_t& block_h, uint32_
  }
  
  NX_HLE("nvnTextureBuilderGetStorageSize", GetStorageSize);
