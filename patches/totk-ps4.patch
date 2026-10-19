@@ -218,6 +218,30 @@ index 73bb101..5f95b44 100644
      funcs = an.functions
      if args.only:
          want = {int(x, 16) for x in args.only}
+diff --git a/recomp/analysis.py b/recomp/analysis.py
+index c40659d..ef9e6cb 100644
+--- a/recomp/analysis.py
++++ b/recomp/analysis.py
+@@ -285,6 +285,19 @@ def _jump_table(an, f, br):
+                     break
+                 continue
+             out.append(t)
++        # Past a bound: entries that still land on this function's instructions are taken too, up to the first that
++        # does not. A bound read from the wrong cmp came out one short (Tears of the Kingdom's main+4da6d0: 12 tables
++        # share one index, the call went to entry 15 of 0..15), and extra cases only fire on their exact targets.
++        if count is not None:
++            for k in range(count, 256):
++                p = table + k * size
++                if p + size > len(m.image):
++                    break
++                v = int.from_bytes(m.image[p:p + size], "little", signed=signed)
++                t = anchor + (v << shift)
++                if not (f.start <= t < f.end) or t not in an.insns:
++                    break
++                out.append(t)
+         return out, misses
+ 
+     table = _const(an, f, a_ld, base_reg)
 diff --git a/recomp/emit.py b/recomp/emit.py
 index 61030bc..e0c08a6 100644
 --- a/recomp/emit.py
