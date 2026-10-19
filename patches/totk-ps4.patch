@@ -1262,7 +1262,7 @@ index e5d47f2..4098c7b 100644
              last = f;
              since = now;
 diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
-index be9efae..1cc3c6d 100644
+index be9efae..2b02048 100644
 --- a/runtime/src/loader.cpp
 +++ b/runtime/src/loader.cpp
 @@ -3,6 +3,7 @@
@@ -1301,11 +1301,11 @@ index be9efae..1cc3c6d 100644
 +    }
 +    if (n > 3000 && n % 1000) return;
 +    if (exit == 2)
-+        log("trace @ %s #%llu x0 %llx x1 %llx x2 %llx x3 %llx x8 %llx x19 %llx x20 %llx x25 %llx x26 %llx",
++        log("trace @ %s #%llu x0 %llx x1 %llx x2 %llx x3 %llx x8 %llx (%s) x19 %llx x20 %llx x25 %llx x26 %llx",
 +            describe(addr).c_str(), (unsigned long long)n, (unsigned long long)c.x[0], (unsigned long long)c.x[1],
 +            (unsigned long long)c.x[2], (unsigned long long)c.x[3], (unsigned long long)c.x[8],
-+            (unsigned long long)c.x[19], (unsigned long long)c.x[20], (unsigned long long)c.x[25],
-+            (unsigned long long)c.x[26]);
++            describe(c.x[8]).c_str(), (unsigned long long)c.x[19], (unsigned long long)c.x[20],
++            (unsigned long long)c.x[25], (unsigned long long)c.x[26]);
 +    else if (!exit)
 +        log("trace > %s #%llu (%llx, %llx, %llx, %llx) lr %s", describe(addr).c_str(), (unsigned long long)n,
 +            (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2],
@@ -1787,7 +1787,7 @@ index ea6c20c..41d0cba 100644
  
  }  // namespace nx::nvn
 diff --git a/runtime/src/nvn/nvn_debug.cpp b/runtime/src/nvn/nvn_debug.cpp
-index 4f1910e..411dcec 100644
+index 4f1910e..48365a4 100644
 --- a/runtime/src/nvn/nvn_debug.cpp
 +++ b/runtime/src/nvn/nvn_debug.cpp
 @@ -6,7 +6,9 @@
@@ -1813,7 +1813,7 @@ index 4f1910e..411dcec 100644
  
  }  // namespace
  
-@@ -476,6 +482,155 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
+@@ -476,6 +482,162 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
  
  bool debug_snapshots_pending() { return !g_snaps.empty(); }
  
@@ -1911,6 +1911,13 @@ index 4f1910e..411dcec 100644
 +        log("diag: storyboard of frame %llu: %d pictures in %s/diag", (unsigned long long)presents, g_diag_seq,
 +            plat::data_root().c_str());
 +    }
++    // NX_DIAG_EVERY=<presents>: a storyboard every that many presents (each replaces the last), for a scene that is
++    // hard to reach with the menu open (Tears of the Kingdom's black world).
++    static const uint64_t every = [] {
++        const char* e = std::getenv("NX_DIAG_EVERY");
++        return e ? std::strtoull(e, nullptr, 10) : 0ull;
++    }();
++    if (every && presents && presents % every == 0) g_diag_armed = true;
 +    if (presents % 60 == 0) {  // the file request
 +        std::string req = plat::data_root() + "/diag_now";
 +        if (FILE* f = plat::fopen_utf8(req, "rb")) {
@@ -1969,7 +1976,7 @@ index 4f1910e..411dcec 100644
  void debug_snapshots_write() {  // after the submit's fence
      for (Snap& snap : g_snaps) {
          void* p = nullptr;
-@@ -489,6 +644,52 @@ void debug_snapshots_write() {  // after the submit's fence
+@@ -489,6 +651,52 @@ void debug_snapshots_write() {  // after the submit's fence
                  std::fclose(f);
              }
              p_vkUnmapMemory(vk_device(), snap.s.buffer_memory);
