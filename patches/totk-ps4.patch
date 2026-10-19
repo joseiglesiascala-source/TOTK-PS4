@@ -243,7 +243,7 @@ index c40659d..ef9e6cb 100644
  
      table = _const(an, f, a_ld, base_reg)
 diff --git a/recomp/emit.py b/recomp/emit.py
-index 61030bc..e0c08a6 100644
+index 61030bc..c3cbc71 100644
 --- a/recomp/emit.py
 +++ b/recomp/emit.py
 @@ -121,6 +121,7 @@ from .emit_neon_wide import NeonWideOps  # noqa: E402
@@ -254,7 +254,15 @@ index 61030bc..e0c08a6 100644
          self.an = an
          self.m = an.module
          self.cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
-@@ -233,6 +234,7 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+@@ -225,6 +226,7 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+     def function(self, f):
+         self.labels = set()
+         self.setjmp_sites = []
++        self.dispatch = []  # jump-table targets of this function, served by one switch (i_br)
+         body = []
+         code = bytes(self.m.image[f.start:f.end])
+         insns = {}
+@@ -233,6 +235,7 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
              insns[a] = got[0] if got else None
          jt = self.an.jump_tables
          last_term = False
@@ -262,7 +270,7 @@ index 61030bc..e0c08a6 100644
          for a in range(f.start, f.end, 4):
              i = insns[a]
              if i is None:
-@@ -249,9 +251,16 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+@@ -249,9 +252,18 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
                  stmt = f"nx::unimpl(c, {B} + {a:#x}ull, \"{txt}\"); // {e}"
              if f.start in self.trace_sp and ("sp" in i.op_str.split(",")[0] or "[sp" in i.op_str and i.writeback):
                  stmt += f" nx::trace_sp(c, {B} + {a:#x}ull);"
@@ -277,10 +285,23 @@ index 61030bc..e0c08a6 100644
 +        out = [f"{'static ' if traced else ''}void {name}(nx::CPU& NX_RESTRICT c) {{"]
 +        if traced or needs_trace_decl:  # declared here, not in nx/cpu.h: only files holding traced code change
 +            out.insert(0, "namespace nx { void guest_trace(CPU& c, uint64_t addr, int exit); }")
++        if self.dispatch:
++            out.append("    uint64_t jt_ = 0;")
          sj = self.setjmp_sites
          if sj:
              # Functions that call setjmp run inside a try: a longjmp on one of their buffers resumes after the call.
-@@ -276,6 +285,9 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+@@ -267,6 +279,10 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+             # Falls off the end: continue into whatever follows.
+             out.append("    " + (f"{self.fn(f.end)}(c);" if f.end in self.entries else
+                                  f"nx::call(c, {B} + {f.end:#x}ull);"))
++        if self.dispatch:  # the jump tables' br: a target of this function, or a tail call
++            out.append("    return;")
++            cases = " ".join(f"case {B} + {t:#x}ull: goto L_{t:X};" for t in self.dispatch)
++            out.append(f"L_jt_:; switch (jt_) {{ {cases} default: nx::call(c, jt_); return; }}")
+         if sj:
+             out.append("    return;")
+             out.append("    } catch (const nx::LongJmp& e_) {")
+@@ -276,6 +292,9 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
              out.append("        js_[jr_].restore(c); c.x[0] = e_.val ? e_.val : 1;")
              out.append("    } }")
          out.append("}")
@@ -290,21 +311,27 @@ index 61030bc..e0c08a6 100644
          return "\n".join(out)
  
      # ---- instruction dispatch -----------------------------------------------------------------------------
-@@ -314,8 +326,12 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+@@ -314,10 +333,16 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
      def i_br(self, f, i, ops, jt):
          r = self.regop(i, ops[0])
          if i.address in jt:
 -            cases = " ".join(f"case {B} + {t:#x}ull: goto L_{t:X};" for t in jt[i.address])
 -            for t in jt[i.address]:
+-                self.labels.add(t)
+-            return f"switch ({r.r()}) {{ {cases} default: nx::call(c, {r.r()}); return; }}"
 +            # Every jump-table target of the function, not only this table's: a table's bound can come out short
 +            # (Tears of the Kingdom's main+13c6c5c reached main+13c72f0, in another of its tables, through this br),
 +            # and a case only fires on its exact target, which is where the guest's br goes anyway.
-+            targets = sorted({t for a, ts in jt.items() if f.start <= a < f.end for t in ts})
-+            cases = " ".join(f"case {B} + {t:#x}ull: goto L_{t:X};" for t in targets)
-+            for t in targets:
-                 self.labels.add(t)
-             return f"switch ({r.r()}) {{ {cases} default: nx::call(c, {r.r()}); return; }}"
++            # One switch per function (L_jt_), not one per br: Tears of the Kingdom's main+4d9ba0 has 12 tables over
++            # ~245 shared targets, and twelve copies of that switch took clang past 7 GB.
++            if not self.dispatch:
++                self.dispatch = sorted({t for a, ts in jt.items() if f.start <= a < f.end for t in ts})
++                for t in self.dispatch:
++                    self.labels.add(t)
++            return f"{{ jt_ = {r.r()}; goto L_jt_; }}"
          return f"{{ nx::call(c, {r.r()}); return; }}"
+ 
+     def i_ret(self, f, i, ops):
 diff --git a/recomp/nso.py b/recomp/nso.py
 index 5df6158..1adfd41 100644
 --- a/recomp/nso.py
