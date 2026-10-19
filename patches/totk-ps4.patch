@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 761b5dd..46a55bd 100644
+index 761b5dd..3f2ca95 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -4,6 +4,9 @@ project(SwitchGamesRecomp C CXX)
@@ -43,15 +43,16 @@ index 761b5dd..46a55bd 100644
          # Hidden visibility: calls between recompiled functions are direct, not through the PLT.
          # armv8.2-a+crypto: cpu.h's AES/SHA paths need __ARM_FEATURE_AES/SHA2 (the NDK default armv8-a has neither).
          target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition
-@@ -105,6 +118,7 @@ set(NX_RUNTIME_SOURCES
+@@ -105,6 +118,8 @@ set(NX_RUNTIME_SOURCES
      runtime/src/hle_net.cpp
      runtime/src/hle_audio.cpp
      runtime/src/hle_pl.cpp
 +    runtime/src/hle_nfp.cpp
++    runtime/src/hle_opus.cpp
      runtime/src/input_script.cpp
      runtime/src/touch_layout.cpp
      runtime/src/perf_hint.cpp
-@@ -166,6 +180,30 @@ set(NX_RUNTIME_SOURCES
+@@ -166,6 +181,30 @@ set(NX_RUNTIME_SOURCES
  file(GLOB NX_GAME_SOURCES CONFIGURE_DEPENDS "${NX_GAME_DIR}/*.cpp")
  list(APPEND NX_RUNTIME_SOURCES ${NX_GAME_SOURCES})
  
@@ -82,7 +83,7 @@ index 761b5dd..46a55bd 100644
  # Vulkan headers (the same registry version tools/gen_vk.py generated from). The loader comes with the GPU driver.
  if(DEFINED ENV{VULKAN_SDK})
      set(NX_VULKAN_SDK "$ENV{VULKAN_SDK}" CACHE PATH "Vulkan SDK")
-@@ -173,7 +211,24 @@ else()
+@@ -173,7 +212,31 @@ else()
      set(NX_VULKAN_SDK "C:/VulkanSDK/1.4.357.0" CACHE PATH "Vulkan SDK")
  endif()
  
@@ -100,6 +101,13 @@ index 761b5dd..46a55bd 100644
 +    target_compile_definitions(${NX_GAME} PRIVATE NX_PS4_APP_NAME=${NX_PS4_APP})
 +    target_link_libraries(${NX_GAME} PRIVATE ${NX_GAME_LIBS})
 +    ps4_link_mesa(${NX_GAME})
++    # nn::codec hardware Opus (runtime/src/hle_opus.cpp): PacBrew's libopus. Only that file sees its headers (a link
++    # to usr/include/opus in the build directory): the rest of PacBrew's usr/include must not shadow the sysroot.
++    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/opus-include")
++    file(CREATE_LINK "${OPENORBIS}/usr/include/opus" "${CMAKE_BINARY_DIR}/opus-include/opus" SYMBOLIC)
++    set_source_files_properties(runtime/src/hle_opus.cpp PROPERTIES
++        INCLUDE_DIRECTORIES "${CMAKE_BINARY_DIR}/opus-include" COMPILE_DEFINITIONS NX_HAS_OPUS)
++    target_link_libraries(${NX_GAME} PRIVATE ${OPENORBIS}/usr/lib/libopus.a)
 +    # The network library's shares (port/ps4_netfs.cpp, inert unless a /net path is opened) and the system libraries.
 +    target_link_libraries(${NX_GAME} PRIVATE ${PS4_SYSROOT}/lib/libnfs.a ${PS4_SYSROOT}/lib/libsmb2.a
 +        ${PS4_SYSROOT}/lib/libz.a SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet)
@@ -108,7 +116,7 @@ index 761b5dd..46a55bd 100644
      # NativeActivity app: lib<game>.so, entry android_main (android_native_app_glue).
      set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue")
      add_library(${NX_GAME} SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp
-@@ -183,7 +238,7 @@ if(ANDROID)
+@@ -183,7 +246,7 @@ if(ANDROID)
      # Our ANativeActivity_onCreate (platform_android.cpp) runs first, on the UI thread, then calls the glue's.
      set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
          COMPILE_DEFINITIONS "ANativeActivity_onCreate=glue_ANativeActivity_onCreate")
@@ -117,7 +125,7 @@ index 761b5dd..46a55bd 100644
      target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition -march=armv8.2-a+crypto)
      # The glue's ANativeActivity_onCreate must be exported. 16 KB page alignment: Android 15+ devices with 16 KB pages.
      target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
-@@ -194,7 +249,7 @@ elseif(APPLE)
+@@ -194,7 +257,7 @@ elseif(APPLE)
      find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h HINTS /opt/homebrew/include /usr/local/include)
      add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_mac.cpp runtime/src/memguard_mac.cpp)
      target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_INCLUDE}")
@@ -126,7 +134,7 @@ index 761b5dd..46a55bd 100644
      target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden)
      # The executable loads near 0x1_0000_0000, below the guest ranges (0x40_0000_0000 and up). The game runs on its
      # own thread with a 64 MiB stack (platform_mac.cpp), so the main thread's stack size does not matter.
-@@ -206,14 +261,14 @@ elseif(UNIX)
+@@ -206,14 +269,14 @@ elseif(UNIX)
      find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h HINTS "${NX_VULKAN_SDK}/include" /usr/include /usr/local/include)
      add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_linux.cpp runtime/src/memguard_linux.cpp)
      target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_INCLUDE}")
@@ -1051,6 +1059,152 @@ index 0000000..d70dc59
 +NX_HLE("_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", NoDevice);
 +
 +}  // namespace nx
+diff --git a/runtime/src/hle_opus.cpp b/runtime/src/hle_opus.cpp
+new file mode 100644
+index 0000000..d34dfcd
+--- /dev/null
++++ b/runtime/src/hle_opus.cpp
+@@ -0,0 +1,140 @@
++// nn::codec's hardware Opus decoder at the API level, with libopus on the host (the hwopus service is libopus on
++// the console's audio DSP). Each input frame carries Nintendo's 8-byte big-endian header {payload size, final range};
++// the decoder's final range is checked against it. The decoder state stays on the host: the game's work buffer is
++// reserved but unused. Without this the sdk's client talked to the stub hwopus service, got no decoder and crashed
++// in DecodeOpusInterleavedWithHardware (Tears of the Kingdom). As MacNativeGames' opus_codec.c.
++// Built where libopus is linked (NX_HAS_OPUS: the PS4 build, PacBrew's libopus).
++#if defined(NX_HAS_OPUS)
++
++#include <cstdint>
++#include <cstring>
++#include <map>
++#include <mutex>
++
++#include <opus/opus.h>
++
++#include <nx/runtime.h>
++
++namespace nx {
++
++namespace {
++
++constexpr uint32_t kInvalid = 0x1FCD1;  // codec module 111: invalid argument
++
++struct Decoder {
++    OpusDecoder* dec = nullptr;
++    int rate = 0, channels = 0;
++};
++std::mutex g_lock;
++std::map<uint64_t, Decoder> g_decoders;  // by the game's HardwareOpusDecoderType*
++
++bool valid_format(int rate, int channels) {
++    return (rate == 48000 || rate == 24000 || rate == 16000 || rate == 12000 || rate == 8000) &&
++           (channels == 1 || channels == 2);
++}
++
++uint64_t work_size(int rate, int channels) {
++    return valid_format(rate, channels) ? uint64_t(opus_decoder_get_size(channels)) + 0x1000 : 0;
++}
++
++Decoder* find(uint64_t guest) {
++    std::lock_guard lk(g_lock);
++    auto it = g_decoders.find(guest);
++    return it == g_decoders.end() ? nullptr : &it->second;
++}
++
++void GetWorkBufferSize(CPU& c) { c.x[0] = work_size(int(c.x[0]), int(c.x[1])); }  // (int rate, int channels, int)
++
++// (HardwareOpusDecoderType*, int rate, int channels, void* work, size_t size, int option)
++void Initialize(CPU& c) {
++    uint64_t guest = c.x[0];
++    int rate = int(c.x[1]), channels = int(c.x[2]);
++    if (!guest || !valid_format(rate, channels) || c.x[4] < work_size(rate, channels)) {
++        c.x[0] = kInvalid;
++        return;
++    }
++    int err = 0;
++    OpusDecoder* dec = opus_decoder_create(rate, channels, &err);
++    if (!dec || err != OPUS_OK) fatal("opus_decoder_create(%d, %d): %s", rate, channels, opus_strerror(err));
++    std::lock_guard lk(g_lock);
++    Decoder& d = g_decoders[guest];
++    if (d.dec) opus_decoder_destroy(d.dec);
++    d = {dec, rate, channels};
++    static bool logged = false;
++    if (!logged) log("codec: hardware Opus decoder on libopus %s", opus_get_version_string()), logged = true;
++    c.x[0] = 0;
++}
++
++void Finalize(CPU& c) {
++    std::lock_guard lk(g_lock);
++    auto it = g_decoders.find(c.x[0]);
++    if (it != g_decoders.end()) {
++        opus_decoder_destroy(it->second.dec);
++        g_decoders.erase(it);
++    }
++}
++
++void GetSampleRate(CPU& c) {
++    Decoder* d = find(c.x[0]);
++    c.x[0] = d ? uint64_t(d->rate) : 0;
++}
++
++void GetChannelCount(CPU& c) {
++    Decoder* d = find(c.x[0]);
++    c.x[0] = d ? uint64_t(d->channels) : 0;
++}
++
++void Reset(CPU& c) {
++    Decoder* d = find(c.x[0]);
++    c.x[0] = d && opus_decoder_ctl(d->dec, OPUS_RESET_STATE) == OPUS_OK ? 0 : kInvalid;
++}
++
++uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
++
++// (HardwareOpusDecoderType*, size_t* consumed, int* samples, int16_t* out, size_t out_size, const void* in,
++//  size_t in_size)
++void Decode(CPU& c) {
++    Decoder* d = find(c.x[0]);
++    uint64_t consumed = c.x[1], samples = c.x[2], out = c.x[3], out_size = c.x[4], in = c.x[5], in_size = c.x[6];
++    if (!d || !consumed || !samples || !out || !in || in_size < 8) {
++        c.x[0] = kInvalid;
++        return;
++    }
++    const uint8_t* p = reinterpret_cast<const uint8_t*>(in);
++    uint32_t n = be32(p), range = be32(p + 4);
++    if (n > in_size - 8) {
++        c.x[0] = kInvalid;
++        return;
++    }
++    int max = int(out_size / (sizeof(int16_t) * uint64_t(d->channels)));
++    int got = opus_decode(d->dec, p + 8, opus_int32(n), reinterpret_cast<opus_int16*>(out), max, 0);
++    if (got < 0) {
++        static int logged = 0;
++        if (logged++ < 10) log("codec: opus_decode: %s", opus_strerror(got));
++        c.x[0] = kInvalid;
++        return;
++    }
++    opus_uint32 final_range = 0;
++    opus_decoder_ctl(d->dec, OPUS_GET_FINAL_RANGE(&final_range));
++    if (n && final_range != range) {
++        static int logged = 0;
++        if (logged++ < 10) log("codec: Opus final range %#x, the stream says %#x", final_range, range);
++    }
++    st<uint64_t>(consumed, 8 + n);
++    st<int32_t>(samples, got);
++    c.x[0] = 0;
++}
++
++}  // namespace
++
++NX_HLE("_ZN2nn5codec36GetHardwareOpusDecoderWorkBufferSizeEiii", GetWorkBufferSize);
++NX_HLE("_ZN2nn5codec29InitializeHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeEiiPvmi", Initialize);
++NX_HLE("_ZN2nn5codec27FinalizeHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeE", Finalize);
++NX_HLE("_ZN2nn5codec32GetHardwareOpusDecoderSampleRateEPKNS0_23HardwareOpusDecoderTypeE", GetSampleRate);
++NX_HLE("_ZN2nn5codec34GetHardwareOpusDecoderChannelCountEPKNS0_23HardwareOpusDecoderTypeE", GetChannelCount);
++NX_HLE("_ZN2nn5codec24ResetHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeE", Reset);
++NX_HLE("_ZN2nn5codec33DecodeOpusInterleavedWithHardwareEPNS0_23HardwareOpusDecoderTypeEPmPiPsmPKvm", Decode);
++
++}  // namespace nx
++
++#endif  // NX_HAS_OPUS
 diff --git a/runtime/src/hle_pl.cpp b/runtime/src/hle_pl.cpp
 index 89f75e4..f6899c1 100644
 --- a/runtime/src/hle_pl.cpp
