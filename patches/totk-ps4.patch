@@ -170,13 +170,15 @@ index 29198e9..aae698c 100644
          if (rename(part.c_str(), final_path.c_str()) != 0) fail("cannot rename %s (%s)", part.c_str(), strerror(errno));
 diff --git a/games/totk/game.cpp b/games/totk/game.cpp
 new file mode 100644
-index 0000000..1d68a2c
+index 0000000..0374faa
 --- /dev/null
 +++ b/games/totk/game.cpp
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,24 @@
 +// The Legend of Zelda: Tears of the Kingdom (0100F2C0115B6000, 1.0.0): what the shared runtime needs to know about
 +// the game. It draws through NVN like Wonder. Modules: main, subsdk0 and sdk (modules.cmake), generated with
 +// --base 0x4000000000 (main), 0x4018000000 (subsdk0) and 0x4010000000 (sdk) (the PS4 port: scripts/prepare-game.sh).
++#include <cstdlib>
++
 +#include <nx/game.h>
 +#include <nx/runtime.h>
 +
@@ -186,7 +188,12 @@ index 0000000..1d68a2c
 +                                "io.github.totkrecomp", "private/totk",
 +                                game::kSystemResourceFromNpdm /* main.npdm META +0x14 */};
 +
-+void game::after_init() {}
++// Runtime defaults for this game (config.txt still overrides them: setenv does not replace a value already set).
++void game::after_init() {
++    // nvnMemoryPoolInvalidateMappedRange without waiting for the submits so far (nvn_objects.cpp): TOTK calls it ~10
++    // times a frame, and the wait kept its main thread behind the whole replay (30-57 ms a frame).
++    setenv("NX_INVALIDATE_WAIT", "0", 0);
++}
 +void game::renderer_start() {}
 +void game::first_frame() {}
 +
@@ -2224,7 +2231,7 @@ index 9dded7d..103dc85 100644
  
  // NX_TRACE_SKIN: skinned draws' inputs, vertex uniform blocks and the bone rows they select.
 diff --git a/runtime/src/nvn/nvn_draw_trace.cpp b/runtime/src/nvn/nvn_draw_trace.cpp
-index e75c126..38b5180 100644
+index e75c126..9f5ca47 100644
 --- a/runtime/src/nvn/nvn_draw_trace.cpp
 +++ b/runtime/src/nvn/nvn_draw_trace.cpp
 @@ -51,6 +51,18 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
@@ -2307,6 +2314,17 @@ index e75c126..38b5180 100644
      // NX_TRACE_DRAWS=<first draw>: logs 80 draws from there.
      static const char* trace_env = std::getenv("NX_TRACE_DRAWS");
      static const uint64_t trace_from = trace_env ? std::strtoull(trace_env, nullptr, 10) : 0;
+@@ -358,6 +417,10 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
+             if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+                 log("  vs c3 @%llx: %g %g %g %g | %g %g %g %g", (unsigned long long)u.address, f[0], f[1], f[2], f[3], f[4],
+                     f[5], f[6], f[7]);
++        for (int blk = 0; blk < 4; blk++)  // the binding sizes: a read past one gives 0 on the PS4 (bounds checks)
++            if (const Range& u = g_state.uniforms[1][blk]; u.address)
++                log("  fs uniform block %d (c%d) @%llx size %llu", blk, blk + 3, (unsigned long long)u.address,
++                    (unsigned long long)u.size);
+         if (const Range& u = g_state.uniforms[1][0]; u.address)
+             if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+                 for (uint64_t k = 0; k < std::min<uint64_t>(u.size / 16, 8); k++)
 diff --git a/runtime/src/nvn/nvn_format.cpp b/runtime/src/nvn/nvn_format.cpp
 index 8af9918..72b41e5 100644
 --- a/runtime/src/nvn/nvn_format.cpp
@@ -2467,10 +2485,38 @@ index 45e9b2a..47b2530 100644
  
  void janitor_wait(const std::atomic<bool>& done) {
 diff --git a/runtime/src/nvn/nvn_objects.cpp b/runtime/src/nvn/nvn_objects.cpp
-index a2a7dd0..68f1bc4 100644
+index a2a7dd0..45046c1 100644
 --- a/runtime/src/nvn/nvn_objects.cpp
 +++ b/runtime/src/nvn/nvn_objects.cpp
-@@ -543,9 +543,18 @@ void write_texels(CPU& c, uint64_t row_stride, uint64_t image_stride) {
+@@ -112,7 +112,7 @@ void MemoryPoolInitialize(CPU& c) {
+ }
+ 
+ void MemoryPoolFinalize(CPU& c) {
+-    wait_submits_so_far(kWaitInvalidate);  // a submit replayed on another thread may still read it
++    wait_submits_so_far(kWaitFinalize);  // a submit replayed on another thread may still read it
+     worker_finish();                    // the replay thread may still read it
+     gpu_wait(gpu_write_back_serial());  // NX_ASYNC_GPU: no compute result lands in freed memory
+     if (auto* p = get<MemoryPool>(c.x[0])) pool_unregister(p), command_memory_released(p->gpu, p->size);
+@@ -191,8 +191,17 @@ void MemoryPoolFlushMappedRange(CPU& c) {
+     }
+ }
+ // The CPU is about to read what the GPU wrote: with NX_ASYNC_GPU, compute results still in flight are waited for.
++// NX_INVALIDATE_WAIT=0 (Tears of the Kingdom's default, games/totk/game.cpp): no wait. On the console this is a cache
++// operation, and a game that needs a result waits on its sync first (nvnSyncWait waits for the submit and its
++// write-backs). TOTK invalidates ~10 times a frame, and waiting for the submits so far each time put its main thread
++// behind the whole replay: 30-57 ms a frame (v00.15).
+ void MemoryPoolInvalidateMappedRange(CPU&) {
+-    wait_submits_so_far(kWaitFinalize);  // a submit replayed on another thread: its results first (nvn_queue.cpp)
++    static const bool wait = [] {
++        const char* e = std::getenv("NX_INVALIDATE_WAIT");
++        return !e || e[0] != '0';
++    }();
++    if (!wait) return;
++    wait_submits_so_far(kWaitInvalidate);  // a submit replayed on another thread: its results first (nvn_queue.cpp)
+     worker_finish();  // compute results reach guest memory when their submit is replayed and done
+     gpu_wait(gpu_write_back_serial());
+ }
+@@ -543,9 +552,18 @@ void write_texels(CPU& c, uint64_t row_stride, uint64_t image_stride) {
      static std::map<uint64_t, uint64_t> counts;
      std::lock_guard lk(objects_lock());
      uint64_t n = ++counts[c.x[0]];
