@@ -219,7 +219,7 @@ index 73bb101..5f95b44 100644
      if args.only:
          want = {int(x, 16) for x in args.only}
 diff --git a/recomp/emit.py b/recomp/emit.py
-index 61030bc..70db682 100644
+index 61030bc..e0c08a6 100644
 --- a/recomp/emit.py
 +++ b/recomp/emit.py
 @@ -121,6 +121,7 @@ from .emit_neon_wide import NeonWideOps  # noqa: E402
@@ -266,6 +266,21 @@ index 61030bc..70db682 100644
          return "\n".join(out)
  
      # ---- instruction dispatch -----------------------------------------------------------------------------
+@@ -314,8 +326,12 @@ class Emitter(ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps):
+     def i_br(self, f, i, ops, jt):
+         r = self.regop(i, ops[0])
+         if i.address in jt:
+-            cases = " ".join(f"case {B} + {t:#x}ull: goto L_{t:X};" for t in jt[i.address])
+-            for t in jt[i.address]:
++            # Every jump-table target of the function, not only this table's: a table's bound can come out short
++            # (Tears of the Kingdom's main+13c6c5c reached main+13c72f0, in another of its tables, through this br),
++            # and a case only fires on its exact target, which is where the guest's br goes anyway.
++            targets = sorted({t for a, ts in jt.items() if f.start <= a < f.end for t in ts})
++            cases = " ".join(f"case {B} + {t:#x}ull: goto L_{t:X};" for t in targets)
++            for t in targets:
+                 self.labels.add(t)
+             return f"switch ({r.r()}) {{ {cases} default: nx::call(c, {r.r()}); return; }}"
+         return f"{{ nx::call(c, {r.r()}); return; }}"
 diff --git a/recomp/nso.py b/recomp/nso.py
 index 5df6158..1adfd41 100644
 --- a/recomp/nso.py
@@ -5846,6 +5861,35 @@ index 0000000..c4ebfdf
 +uint64_t vk_flips();
 +
 +}  // namespace nx::plat::ps4
+diff --git a/runtime/src/svc_am.cpp b/runtime/src/svc_am.cpp
+index e14ff2d..53a8f87 100644
+--- a/runtime/src/svc_am.cpp
++++ b/runtime/src/svc_am.cpp
+@@ -130,12 +130,23 @@ std::shared_ptr<Service> application_functions() {
+     });
+ }
+ 
++// The expected master volumes: full. Unanswered they read 0 (Tears of the Kingdom asks for both at boot).
++std::shared_ptr<Service> audio_controller() {
++    return svc("IAudioController", [](Service& s) {
++        s.cmds[0] = [](IpcCtx&) { return 0u; };                       // SetExpectedMasterVolume
++        s.cmds[1] = [](IpcCtx& c) { c.push(1.0f); return 0u; };       // GetMainAppletExpectedMasterVolume
++        s.cmds[2] = [](IpcCtx& c) { c.push(1.0f); return 0u; };       // GetLibraryAppletExpectedMasterVolume
++        s.cmds[3] = [](IpcCtx&) { return 0u; };                       // ChangeMainAppletMasterVolume
++        s.cmds[4] = [](IpcCtx&) { return 0u; };                       // SetTransparentVolumeRate
++    });
++}
++
+ std::shared_ptr<Service> application_proxy() {
+     return svc("IApplicationProxy", [](Service& s) {
+         s.cmds[0] = [](IpcCtx& c) { c.push_object(common_state_getter()); return 0u; };
+         s.cmds[1] = [](IpcCtx& c) { c.push_object(self_controller()); return 0u; };
+         s.cmds[2] = [](IpcCtx& c) { c.push_object(window_controller()); return 0u; };
+-        s.cmds[3] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IAudioController")); return 0u; };
++        s.cmds[3] = [](IpcCtx& c) { c.push_object(audio_controller()); return 0u; };
+         s.cmds[4] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IDisplayController")); return 0u; };
+         s.cmds[10] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IProcessWindingController")); return 0u; };
+         s.cmds[11] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("ILibraryAppletCreator")); return 0u; };
 diff --git a/runtime/src/svc_process.cpp b/runtime/src/svc_process.cpp
 index 05979b5..dcf68bb 100644
 --- a/runtime/src/svc_process.cpp
