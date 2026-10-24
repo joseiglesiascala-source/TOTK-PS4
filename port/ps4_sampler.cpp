@@ -38,8 +38,23 @@ constexpr int kRipIndex = 20, kRspIndex = 23;
 // Samples in system libraries (libkernel/libc at 0x800000000+) are attributed to the eboot
 // function that called into them: the first eboot code address on the stack, tagged.
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kCallerTag = 1ULL << 62;
+// A system-library sample whose callers were found: the first two eboot return addresses above rsp (relative to .text,
+// 30 bits each, 16-byte buckets: the first is often a libc++ wrapper such as std::mutex::lock, the second its user),
+// tagged, and whether the thread sits in the _umtx_op system call (a mutex or condition variable wait). Printed as
+// "wait"/"call" lines: who is waiting, not only that libkernel is.
+constexpr uint64_t kFromTag = 1ULL << 61, kUmtxTag = 1ULL << 60, kTags = 0xFULL << 60;
+constexpr int kCallerScan = 96;  // words above rsp searched for the first eboot return address
+// The end of the eboot's executable segment (findTextEnd, before the first sample): a candidate return address must
+// lie below it. kTextWindow alone let a stack value of 1000000000 (a time in ns) pass, and reading the bytes before
+// it faulted in the handler (v00.32 crashed at boot). 0: callers are not looked for.
+uintptr_t g_text_end = 0;
+// Samples inside the string helpers (memcpy, memset, memmove, memcmp: in the eboot, ps4_string.c) keep their caller
+// too, tagged: they were the replay thread's top entries, with no way to tell whose copies they were. Printed as
+// "helper elf <pc> <caller>" lines. [g_helpers_lo, g_helpers_hi): around the four (findTextEnd).
+constexpr uint64_t kHelperTag = 1ULL << 59;
+uintptr_t g_helpers_lo = 0, g_helpers_hi = 0;
 constexpr uintptr_t kTextWindow = 0x40000000;
-constexpr int kMaxThreads = 4;
+constexpr int kMaxThreads = 64;  // the replay thread and every guest thread when profiling (platform_ps4.cpp)
 constexpr int kMaxSamples = 16384;  // per thread and window (10 s at 1 kHz fits)
 
 struct ThreadSamples {
@@ -52,6 +67,19 @@ struct ThreadSamples {
 ThreadSamples g_threads[kMaxThreads];
 std::atomic<int> g_thread_count{0};
 
+// Whether `ret` follows a call instruction (a return address, not a stale code pointer): call rel32 (E8 xx xx xx xx),
+// call *%reg (FF D0+r), call *disp8(%reg) (FF 50+r xx), call *disp32(%reg) / *rip+disp32 (FF 90+r / FF 15 ...).
+bool after_call(const uint8_t* ret) {
+    if (ret[-5] == 0xE8) return true;
+    if (ret[-2] == 0xFF && (ret[-1] & 0xF8) == 0xD0) return true;
+    if (ret[-3] == 0xFF && (ret[-2] & 0xF8) == 0x50) return true;
+    if (ret[-6] == 0xFF && (ret[-5] == 0x15 || (ret[-5] & 0xF8) == 0x90)) return true;
+    if (ret[-3] == 0x41 && ret[-2] == 0xFF && (ret[-1] & 0xF8) == 0xD0) return true;  // call *%r8-%r15
+    return false;
+}
+
+uintptr_t watched_stack_limit(pthread_t thread);  // below: the highest address a scan of its stack may read
+
 void profHandler(int, siginfo_t*, void* context) {
     const pthread_t self = pthread_self();
     for (int i = 0; i < g_thread_count.load(std::memory_order_acquire); i++) {
@@ -63,12 +91,42 @@ void profHandler(int, siginfo_t*, void* context) {
         const int n = t.count.load(std::memory_order_relaxed);
         if (n < kMaxSamples) {
             uint64_t sample = regs[kRipIndex];
+            // How far above rsp the scans below may read: the thread's stack top (a thread sampled right after it
+            // started has little stack above rsp; reading 768 bytes ran off it and crashed v00.42).
+            const uintptr_t rsp = regs[kRspIndex];
+            const uintptr_t top = watched_stack_limit(self);
+            const int words = top > rsp ? int(std::min<uintptr_t>((top - rsp) / 8, uintptr_t(kCallerScan))) : 0;
+            if (sample >= g_helpers_lo && sample < g_helpers_hi && g_text_end) {
+                const uintptr_t text = reinterpret_cast<uintptr_t>(__text_start);
+                const auto* sp = reinterpret_cast<const uint64_t*>(rsp);
+                for (int k = 0; k < std::min(words, 16); k++) {  // a leaf: its return address is at or near rsp
+                    const uint64_t v = sp[k];
+                    if (v >= text + 16 && v < g_text_end && (v < g_helpers_lo || v >= g_helpers_hi) &&
+                        after_call(reinterpret_cast<const uint8_t*>(v))) {
+                        sample = kHelperTag | ((v - text) & ~0xFULL) << 30 | ((sample - text) & ~0xFULL);
+                        break;
+                    }
+                }
+            }
             // Inside a system module: keep the exact address (tagged). The module list at the
             // top of samples.log maps it to a module offset, which the decrypted modules' symbol
-            // tables name. (Blaming "the first eboot address on the stack" picked up stale
-            // values and named the wrong callers.)
-            if (sample >= kSystemLibs && sample < 2 * kSystemLibs)
-                sample |= kCallerTag;
+            // tables name. With its callers found (kFromTag), those are kept instead: only eboot
+            // addresses that follow a call instruction count (blaming "the first eboot address on
+            // the stack" picked up stale values and named the wrong callers).
+            if (sample >= kSystemLibs && sample < 2 * kSystemLibs) {
+                const uintptr_t text = reinterpret_cast<uintptr_t>(__text_start);
+                static const uint8_t kUmtxStub[12] = {0x48, 0xc7, 0xc0, 0xc6, 0x01, 0x00,
+                                                      0x00, 0x49, 0x89, 0xca, 0x0f, 0x05};
+                const bool umtx = memcmp(reinterpret_cast<const uint8_t*>(sample - 12), kUmtxStub, 12) == 0;
+                const auto* sp = reinterpret_cast<const uint64_t*>(rsp);
+                uint64_t from = 0, from2 = 0;
+                for (int k = 0; k < words && !from2 && g_text_end; k++) {
+                    const uint64_t v = sp[k];
+                    if (v >= text + 16 && v < g_text_end && after_call(reinterpret_cast<const uint8_t*>(v)))
+                        (from ? from2 : from) = (v - text) & ~0xFULL;
+                }
+                sample = from ? (kFromTag | (umtx ? kUmtxTag : 0) | from2 << 30 | from) : (sample | kCallerTag);
+            }
             t.samples[n] = sample;
             t.count.store(n + 1, std::memory_order_release);
         }
@@ -103,8 +161,8 @@ void report(int fd, ThreadSamples& t, double window_start) {
     // Eboot and JIT code: bucket by 16 bytes (eboot addresses relative to .text; JIT addresses
     // tagged with bit 63).
     for (int i = 0; i < n; i++) {
-        if (s[i] & kCallerTag) {
-            s[i] &= ~0xFULL;  // system module address (see the module list)
+        if (s[i] & (kCallerTag | kFromTag | kHelperTag)) {
+            s[i] &= ~0xFULL;  // system module address (see the module list), or the eboot caller of one
             continue;
         }
         const bool eboot = s[i] >= text && s[i] < text + kTextWindow;
@@ -119,7 +177,7 @@ void report(int fd, ThreadSamples& t, double window_start) {
         while (j < n && s[j] == s[i])
             j++;
         entries[unique++] = {s[i], j - i};
-        if (!(s[i] >> 62))
+        if (!(s[i] & kTags))
             eboot_samples += j - i;
         i = j;
     }
@@ -139,6 +197,15 @@ void report(int fd, ThreadSamples& t, double window_start) {
                      static_cast<unsigned long long>(address));
             noteHotJit(address, entries[i].count);
         }
+        else if (entries[i].key & kHelperTag)
+            snprintf(line, sizeof(line), "  %5.1f%% helper elf 0x%llx 0x%llx\n", 100.0 * entries[i].count / n,
+                     static_cast<unsigned long long>(entries[i].key & ((1ULL << 30) - 1)),
+                     static_cast<unsigned long long>((entries[i].key & ~(kTags | kHelperTag)) >> 30));
+        else if (entries[i].key & kFromTag)
+            snprintf(line, sizeof(line), "  %5.1f%% %s elf 0x%llx 0x%llx\n", 100.0 * entries[i].count / n,
+                     entries[i].key & kUmtxTag ? "wait" : "call",
+                     static_cast<unsigned long long>(entries[i].key & ((1ULL << 30) - 1)),
+                     static_cast<unsigned long long>((entries[i].key & ~kTags) >> 30));
         else if (entries[i].key & kCallerTag)
             snprintf(line, sizeof(line), "  %5.1f%% sys 0x%llx\n",
                      100.0 * entries[i].count / n,
@@ -209,6 +276,37 @@ void writeModuleList(int fd) {
                             info.segments[g].address, info.segments[g].size, info.segments[g].prot);
         snprintf(line + len, sizeof(line) - len, "\n");
         writeLine(fd, line);
+    }
+}
+
+// The end of the executable segment that holds .text (g_text_end).
+void findTextEnd() {
+    int32_t handles[256];
+    size_t count = 0;
+    if (sceKernelGetModuleList(handles, 256, &count) != 0)
+        return;
+    const uintptr_t text = reinterpret_cast<uintptr_t>(__text_start);
+    for (size_t m = 0; m < count && m < 256; m++) {
+        ModuleInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetModuleInfo(handles[m], &info) != 0)
+            continue;
+        for (uint32_t g = 0; g < info.segment_count && g < 4; g++) {
+            const uintptr_t start = reinterpret_cast<uintptr_t>(info.segments[g].address);
+            if (text >= start && text < start + info.segments[g].size) {
+                const uintptr_t helpers[] = {reinterpret_cast<uintptr_t>(&memcpy), reinterpret_cast<uintptr_t>(&memset),
+                                             reinterpret_cast<uintptr_t>(&memmove),
+                                             reinterpret_cast<uintptr_t>(&memcmp)};
+                uintptr_t lo = UINTPTR_MAX, hi = 0;
+                for (uintptr_t h : helpers)
+                    if (h >= start && h < start + info.segments[g].size) lo = std::min(lo, h), hi = std::max(hi, h);
+                // Adjacent in ps4_string.c: one range, padded by a function's length on each side.
+                if (hi && hi - lo < 0x4000) g_helpers_lo = lo - 0x400, g_helpers_hi = hi + 0x400;
+                g_text_end = start + info.segments[g].size;
+                return;
+            }
+        }
     }
 }
 
@@ -338,6 +436,14 @@ struct WatchedThread {
 };
 WatchedThread g_watched[kMaxWatched];
 std::atomic<int> g_watched_count{0};
+
+// For the sampler's caller scans (profHandler); 0 when the thread is not watched (no scan then). Signal safe.
+uintptr_t watched_stack_limit(pthread_t thread) {
+    const int count = std::min(g_watched_count.load(std::memory_order_acquire), kMaxWatched);
+    for (int i = 0; i < count; i++)
+        if (g_watched[i].thread.load(std::memory_order_relaxed) == thread) return g_watched[i].stack_limit;
+    return 0;
+}
 
 void dumpHandler(int, siginfo_t*, void* context) {
     const pthread_t self = pthread_self();
@@ -646,6 +752,7 @@ extern "C" void ps4_sampler_start() {
     g_sampler_on.store(true);
     if (s_started.exchange(true))
         return;
+    findTextEnd();
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     void (*handler)(int, siginfo_t*, void*) = profHandler;

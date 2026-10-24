@@ -12,6 +12,7 @@
 // - libc++abi runs thread_local destructors through __cxa_thread_atexit_impl, which the PS4
 //   libc lacks (and create-fself refuses unresolved imports).
 
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdarg.h>
@@ -40,6 +41,7 @@ int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t
                                       off_t* physOut);
 int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
                                  size_t align);
+int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
 
 // dlmalloc mspace API (port/ps4_dlmalloc.c).
 typedef void* mspace;
@@ -222,52 +224,195 @@ inline mspace getHeap() {
     return g_heap;
 }
 
-// Overflow heap: direct memory, mapped the first time the main heap can't serve a request.
-// Spider-Man 2 fills most of the 512 MiB main heap; a save state then needed one 99 MiB block
-// (148 MiB in Mario Kart: Double Dash!!), the allocation failed and the app crashed. Direct
-// memory is a separate 4.5 GiB pool (the GPU's); with FOOTERS, free and realloc find this heap
-// from the chunk itself.
-mspace g_overflow = nullptr;
-uintptr_t g_overflowBase = 0;
-size_t g_overflowSize = 0;
-bool g_overflowTried = false;
+// Overflow heaps: direct memory, mapped when the main heap can't serve a request, in segments of 64 MiB (or what one
+// request needs) as they are needed. Spider-Man 2 fills most of the 512 MiB main heap; a save state then needed one
+// 99 MiB block (148 MiB in Mario Kart: Double Dash!!), the allocation failed and the app crashed. Direct memory is a
+// separate 4.5 GiB pool, the GPU's and TOTK's guest memory's too: one 512 MiB overflow heap (v00.57) took all of it
+// 20 s into the boot, used or not, and at the Great Sky Island the pool ran out. With FOOTERS, free and realloc find
+// a chunk's segment from the chunk itself.
+constexpr int MAX_OVERFLOW = 64;
+constexpr size_t OVERFLOW_SEGMENT = 64 * MB;
+struct Overflow {
+    uintptr_t base;
+    size_t size;
+    mspace msp;
+};
+Overflow g_overflows[MAX_OVERFLOW];
+std::atomic<int> g_overflowCount{0};  // published after its entry is filled in
+size_t g_overflowBytes = 0;
+// A sleeping lock: spinning ones livelocked TOTK under the PS4's fixed priorities (see ps4_dlmalloc.c).
+pthread_mutex_t g_overflowLock = PTHREAD_MUTEX_INITIALIZER;
+bool g_overflowFailed = false;  // logged once
+std::atomic<size_t> g_inUse{0};  // bytes handed out (usable sizes), every heap
 
-mspace overflowHeap() {
-    if (mspace msp = __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE))
-        return msp;
-    if (__atomic_exchange_n(&g_overflowTried, true, __ATOMIC_ACQ_REL))
-        return __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE);  // another thread is (or was) at it
-    const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
-    for (size_t size : sizes) {
+// Direct memory for [base, base + size) (reserved by the caller; sizes in 2 MiB): from the top of the pool down, in
+// pieces of up to 16 MiB, smaller where it is that fragmented. CPU memory needs no physically contiguous piece; RADV's
+// buffers and images do, and take theirs from the bottom up, and the guest's memory comes from the top too (the
+// runtime's ps4_lazy.cpp), so what is free stays in one piece. False (all given back, the range unmapped) when there
+// is not enough.
+bool mapTopDown(uintptr_t base, size_t size) {
+    const size_t total = sceKernelGetDirectMemorySize();
+    struct Piece {
+        off_t phys;
+        size_t size;
+    } pieces[256];
+    int count = 0;
+    size_t done = 0;
+    bool ok = true;
+    while (ok && done < size) {
+        size_t piece = size - done < 16 * MB ? size - done : 16 * MB;
         off_t phys = 0;
-        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0)
-            continue;
-        // A hint well above 0x200000000, where the kernel library puts its own objects.
-        void* base = reinterpret_cast<void*>(0x1800000000ull);
-        const int32_t ret = sceKernelMapDirectMemory(&base, size, PROT_CPU_RW, 0, phys, 2 * MB);
-        if (ret != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
-            heapLog("[totk] heap: overflow heap: mapping %zu MiB of direct memory failed (0x%x, %p)\n",
-                    size / MB, ret, base);
-            continue;
+        bool got = false;
+        for (; piece >= 2 * MB && !got && count < 256; piece = (piece / 2) & ~(2 * MB - 1)) {
+            for (size_t start = (total - piece) & ~(2 * MB - 1);; start -= 32 * MB) {
+                if (sceKernelAllocateDirectMemory(off_t(start), off_t(total), piece, 2 * MB, 0, &phys) == 0) {
+                    got = true;
+                    break;
+                }
+                if (start < 32 * MB)
+                    break;
+            }
+            if (got)
+                break;
         }
-        mspace msp = create_mspace_with_base(base, size, 1);
-        if (!msp)
-            continue;
-        g_overflowBase = reinterpret_cast<uintptr_t>(base);
-        g_overflowSize = size;
-        __atomic_store_n(&g_overflow, msp, __ATOMIC_RELEASE);
-        heapLog("[totk] heap: main heap full: overflow heap of %zu MiB of direct memory at %p\n", size / MB,
-                base);
-        return msp;
+        void* at = reinterpret_cast<void*>(base + done);
+        if (got)
+            sceKernelMunmap(at, piece);  // the reservation there: mapping over it fails
+        if (!got || sceKernelMapDirectMemory(&at, piece, PROT_CPU_RW, MAP_FIXED_FLAG, phys, PAGE) != 0 ||
+            at != reinterpret_cast<void*>(base + done)) {
+            if (got)
+                sceKernelReleaseDirectMemory(phys, piece);
+            ok = false;
+            break;
+        }
+        pieces[count++] = {phys, piece};
+        done += piece;
     }
-    heapLog("[totk] heap: main heap full and no direct memory for an overflow heap\n");
-    return nullptr;
+    if (ok)
+        return true;
+    sceKernelMunmap(reinterpret_cast<void*>(base), size);  // the pieces and the rest of the reservation
+    for (int i = 0; i < count; i++)
+        sceKernelReleaseDirectMemory(pieces[i].phys, pieces[i].size);
+    return false;
+}
+
+// One more segment, big enough for `need` bytes. Under g_overflowLock.
+bool addOverflow(size_t need) {
+    const int n = g_overflowCount.load(std::memory_order_relaxed);
+    if (n >= MAX_OVERFLOW)
+        return false;
+    size_t size = OVERFLOW_SEGMENT;
+    if (need + 2 * MB > size)
+        size = (need + 4 * MB) & ~(2 * MB - 1);
+    // A range well above 0x200000000, where the kernel library puts its own objects.
+    void* base = reinterpret_cast<void*>(0x1800000000ull);
+    if (sceKernelReserveVirtualRange(&base, size, 0, 2 * MB) != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
+        heapLog("[totk] heap: no address range for a %zu MiB overflow segment (%p)\n", size / MB, base);
+        return false;
+    }
+    if (!mapTopDown(reinterpret_cast<uintptr_t>(base), size)) {
+        if (!g_overflowFailed)
+            heapLog("[totk] heap: no direct memory for a %zu MiB overflow segment (%zu MiB in %d so far)\n",
+                    size / MB, g_overflowBytes / MB, n);
+        g_overflowFailed = true;
+        return false;
+    }
+    mspace msp = create_mspace_with_base(base, size, 1);
+    if (!msp)
+        return false;
+    g_overflows[n] = {reinterpret_cast<uintptr_t>(base), size, msp};
+    g_overflowBytes += size;
+    g_overflowCount.store(n + 1, std::memory_order_release);
+    heapLog("[totk] heap: overflow segment %d: %zu MiB of direct memory at %p (%zu MiB in all)\n", n + 1,
+            size / MB, base, g_overflowBytes / MB);
+    return true;
+}
+
+// From the overflow segments (newest first, as the newest has the most room), with a new segment when none can
+// serve it. `alloc` allocates from one mspace.
+template <class Alloc>
+void* fromOverflow(size_t need, Alloc alloc) {
+    const int seen = g_overflowCount.load(std::memory_order_acquire);
+    for (int i = seen; i-- > 0;)
+        if (void* p = alloc(g_overflows[i].msp))
+            return p;
+    pthread_mutex_lock(&g_overflowLock);
+    void* p = nullptr;
+    for (int i = g_overflowCount.load(std::memory_order_acquire); i-- > seen && !p;)  // added meanwhile
+        p = alloc(g_overflows[i].msp);
+    if (!p && addOverflow(need))
+        p = alloc(g_overflows[g_overflowCount.load(std::memory_order_relaxed) - 1].msp);
+    pthread_mutex_unlock(&g_overflowLock);
+    return p;
+}
+
+// Big allocations (1 MiB and more) and where they came from, for the memory report (ps4_heap_top): the first code
+// addresses found on the allocating thread's stack (no frame pointers in release builds), as logStack finds them.
+constexpr size_t BIG = 1 * MB;
+constexpr int MAX_BIG = 4096;
+struct BigAlloc {
+    uintptr_t ptr;
+    size_t size;
+    uint32_t where[5];
+};
+BigAlloc g_big[MAX_BIG];
+pthread_mutex_t g_bigLock = PTHREAD_MUTEX_INITIALIZER;
+size_t g_bigUntracked = 0;  // bytes the table had no room for
+
+void noteBig(void* p, size_t size) {
+    BigAlloc a{reinterpret_cast<uintptr_t>(p), size, {}};
+    const uintptr_t base = reinterpret_cast<uintptr_t>(__text_start);
+    const auto* stack = static_cast<const uintptr_t*>(__builtin_frame_address(0));
+    for (int i = 0, found = 0; i < 256 && found < 5; i++)
+        if (stack[i] >= base && stack[i] < base + 0x20000000)
+            a.where[found++] = uint32_t(stack[i] - base);
+    pthread_mutex_lock(&g_bigLock);
+    int slot = 0;
+    while (slot < MAX_BIG && g_big[slot].ptr)
+        slot++;
+    if (slot < MAX_BIG)
+        g_big[slot] = a;
+    else
+        g_bigUntracked += size;
+    pthread_mutex_unlock(&g_bigLock);
+}
+
+void forgetBig(const void* p) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(p);
+    pthread_mutex_lock(&g_bigLock);
+    for (BigAlloc& a : g_big)
+        if (a.ptr == at) {
+            a.ptr = 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_bigLock);
+}
+
+// The in-use count (the memory report's host heap figure), and the big allocations' table.
+inline void* counted(void* p) {
+    if (p) {
+        const size_t size = mspace_usable_size(p);
+        g_inUse.fetch_add(size, std::memory_order_relaxed);
+        if (size >= BIG)
+            noteBig(p, size);
+    }
+    return p;
+}
+inline void uncount(const void* p) {
+    const size_t size = mspace_usable_size(p);
+    g_inUse.fetch_sub(size, std::memory_order_relaxed);
+    if (size >= BIG)
+        forgetBig(p);
 }
 
 bool ownsPointer(const void* p) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(p);
-    return (address >= g_heapBase && address < g_heapBase + g_heapSize) ||
-           (address >= g_overflowBase && address < g_overflowBase + g_overflowSize);
+    if (address >= g_heapBase && address < g_heapBase + g_heapSize)
+        return true;
+    for (int i = g_overflowCount.load(std::memory_order_acquire); i-- > 0;)
+        if (address >= g_overflows[i].base && address < g_overflows[i].base + g_overflows[i].size)
+            return true;
+    return false;
 }
 
 // The operation in progress, for error reports (thread-local: allocations happen on any thread).
@@ -385,11 +530,10 @@ void* __wrap_malloc(size_t size) {
     if (!p)
         p = mspace_malloc(getHeap(), size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_malloc(overflow, size);
+        p = fromOverflow(size, [size](mspace m) { return mspace_malloc(m, size); });
     if (!p)
         reportFailure("malloc", size);
-    return p;
+    return counted(p);
 }
 
 void __wrap_free(void* ptr) {
@@ -406,6 +550,7 @@ void __wrap_free(void* ptr) {
         }
         return;
     }
+    uncount(ptr);
     mspace_free(getHeap(), ptr);
 }
 
@@ -417,11 +562,10 @@ void* __wrap_calloc(size_t nelem, size_t size) {
     if (!p)
         p = mspace_calloc(getHeap(), nelem, size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_calloc(overflow, nelem, size);
+        p = fromOverflow(nelem * size, [nelem, size](mspace m) { return mspace_calloc(m, nelem, size); });
     if (!p)
         reportFailure("calloc", nelem * size);
-    return p;
+    return counted(p);
 }
 
 void* __wrap_realloc(void* ptr, size_t size) {
@@ -435,28 +579,36 @@ void* __wrap_realloc(void* ptr, size_t size) {
         return nullptr;
     }
     if (ptr && size == 0) {
+        uncount(ptr);
         mspace_free(getHeap(), ptr);
         return nullptr;
     }
     // With FOOTERS this grows the chunk inside the arena it came from (the mspace argument is
     // only used for new allocations); when that arena is full, move it to this thread's.
+    const size_t old_size = ptr ? mspace_usable_size(ptr) : 0;
     void* p = ptr ? mspace_realloc(getHeap(), ptr, size) : nullptr;
-    if (!p) {
-        p = t_arena ? mspace_malloc(t_arena, size) : nullptr;
-        if (!p)
-            p = mspace_malloc(getHeap(), size);
-        if (!p)
-            if (mspace overflow = overflowHeap())
-                p = mspace_malloc(overflow, size);
-        if (p && ptr) {
-            const size_t old_size = mspace_usable_size(ptr);
-            memcpy(p, ptr, old_size < size ? old_size : size);
-            mspace_free(getHeap(), ptr);
-        }
+    if (p) {
+        const size_t new_size = mspace_usable_size(p);
+        g_inUse.fetch_add(new_size - old_size, std::memory_order_relaxed);  // wraps: fine
+        if (old_size >= BIG)
+            forgetBig(ptr);
+        if (new_size >= BIG)
+            noteBig(p, new_size);
+        return p;
+    }
+    p = t_arena ? mspace_malloc(t_arena, size) : nullptr;
+    if (!p)
+        p = mspace_malloc(getHeap(), size);
+    if (!p)
+        p = fromOverflow(size, [size](mspace m) { return mspace_malloc(m, size); });
+    if (p && ptr) {
+        memcpy(p, ptr, old_size < size ? old_size : size);
+        uncount(ptr);
+        mspace_free(getHeap(), ptr);
     }
     if (!p)
         reportFailure("realloc", size);
-    return p;
+    return counted(p);
 }
 
 void* __wrap_memalign(size_t alignment, size_t size) {
@@ -467,19 +619,22 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     if (!p)
         p = mspace_memalign(getHeap(), alignment, size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_memalign(overflow, alignment, size);
+        p = fromOverflow(size + alignment,
+                         [alignment, size](mspace m) { return mspace_memalign(m, alignment, size); });
     if (!p)
         reportFailure("memalign", size);
-    return p;
+    return counted(p);
 }
 
-// Gives the calling thread a private arena if it is one of Dolphin's busy threads (called when
-// a thread names itself: Common::SetCurrentThreadName -> ps4_watch_thread).
+// Gives the calling thread a private arena if it is one of the busy threads (called when a thread names itself:
+// nx::plat::set_thread_name -> ps4_watch_thread). TOTK's replay thread spent ~9% of its time on the Great Sky Island
+// (v00.67, samples.log) waiting for the shared heap's lock in free(); it gets a bigger arena than the others.
 void ps4_heap_private_arena(const char* name) {
     static const char* const busy[] = {"CPU thread", "CPU-GPU thread", "Video thread",
                                        "VK submission thread", "AsyncShaderCompiler Worker",
-                                       "DVD thread", "Audio thread - PS4"};
+                                       "DVD thread", "Audio thread - PS4", "nvn replay",
+                                       "nvn janitor", "nvn worker 0", "nvn worker 1",
+                                       "nvn worker 2"};
     if (t_arena || !name || !getHeap())
         return;
     bool wanted = false;
@@ -508,13 +663,14 @@ void ps4_heap_private_arena(const char* name) {
     }
     if (g_arenaCount.fetch_add(1) >= MAX_ARENAS)
         return;
-    void* block = mspace_malloc(getHeap(), ARENA_SIZE);
+    const size_t size = strcmp(name, "nvn replay") == 0 ? 4 * ARENA_SIZE : ARENA_SIZE;
+    void* block = mspace_malloc(getHeap(), size);
     if (!block)
         return;
-    t_arena = create_mspace_with_base(block, ARENA_SIZE, 1);
+    t_arena = create_mspace_with_base(block, size, 1);
     if (t_arena)
         pthread_setspecific(g_arenaKey, t_arena);
-    heapLog("[totk] heap: private %zu MiB arena for '%s'%s\n", ARENA_SIZE / MB, name,
+    heapLog("[totk] heap: private %zu MiB arena for '%s'%s\n", size / MB, name,
             t_arena ? "" : " FAILED");
 }
 
@@ -624,7 +780,6 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
 // kernel's clock on first use, so absolute times from both agree. Other clocks go to the kernel.
 int __real_clock_gettime(clockid_t id, struct timespec* ts);
 uint64_t sceKernelGetTscFrequency_ps4() __asm__("sceKernelGetTscFrequency");
-unsigned long long ps4_clock_reads;  // DolphinNoGUI monitor (approximate, unsynchronised)
 
 int __wrap_clock_gettime(clockid_t id, struct timespec* ts) {
     if (id != CLOCK_MONOTONIC)
@@ -647,7 +802,6 @@ int __wrap_clock_gettime(clockid_t id, struct timespec* ts) {
     }();
     if (!anchor.ok)
         return __real_clock_gettime(id, ts);
-    ps4_clock_reads++;
     const uint64_t ticks = __builtin_ia32_rdtsc() - anchor.tsc;
     const uint64_t ns =
         anchor.ns + static_cast<uint64_t>((static_cast<unsigned __int128>(ticks) * anchor.mult) >> 32);
@@ -673,6 +827,26 @@ int __wrap_pthread_once(pthread_once_t* once, void (*init)(void)) {
     while (__atomic_load_n(state, __ATOMIC_ACQUIRE) != 2)
         sched_yield();
     return 0;
+}
+
+// pthread_cond_wait for every caller (--wrap, the app only): a wait of at most 50 ms, which callers take as a
+// spurious wake-up (POSIX allows them, so each loops on its own condition). On the PS4 a wake-up can be lost: TOTK
+// v00.51 and BotW v00.13 froze with a thread whose condition held still asleep in its wait, our kernel's own waits
+// found ~50 such wake-ups in one boot of TOTK v00.54, and FFmpeg's frame threads (which wait without a deadline)
+// stopped decoding a movie halfway. A lost wake-up now costs up to 50 ms instead of the thread. The deadline is on
+// the condition variable's default clock (CLOCK_REALTIME): one made for another clock waits as before.
+extern "C" int __real_pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex);
+extern "C" int __wrap_pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {
+    struct timespec deadline;
+    if (__real_clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+        return __real_pthread_cond_wait(cond, mutex);
+    deadline.tv_nsec += 50000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+    const int r = pthread_cond_timedwait(cond, mutex, &deadline);
+    return r == ETIMEDOUT || r == EINTR ? 0 : r;
 }
 
 // pthread_create for every caller (--wrap): a PS4 thread inherits its creator's CPU affinity, so a
@@ -781,6 +955,68 @@ int __cxa_thread_atexit_impl(void (*dtor)(void*), void* obj, void* /*dso_symbol*
     entry->next = static_cast<ThreadDtor*>(pthread_getspecific(g_threadDtorKey));
     pthread_setspecific(g_threadDtorKey, entry);
     return 0;
+}
+
+// For the memory report (the runtime's memguard_ps4.cpp): bytes in use (every heap), the main heap's size, the overflow
+// segments' total size and count.
+void ps4_heap_usage(uint64_t* in_use, uint64_t* main_size, uint64_t* overflow_bytes, uint32_t* overflow_segments) {
+    *in_use = g_inUse.load(std::memory_order_relaxed);
+    *main_size = g_heapSize;
+    pthread_mutex_lock(&g_overflowLock);
+    *overflow_bytes = g_overflowBytes;
+    *overflow_segments = uint32_t(g_overflowCount.load(std::memory_order_relaxed));
+    pthread_mutex_unlock(&g_overflowLock);
+}
+
+// The big allocations still held, summed by where they came from, biggest first, as lines into `out` (for the
+// runtime's memory report). Returns the number of lines.
+int ps4_heap_top(char* out, size_t size) {
+    struct Sum {
+        uint32_t where[5];
+        size_t bytes;
+        int count;
+    };
+    static Sum sums[256];
+    int n = 0;
+    size_t total = 0, untracked = 0;
+    pthread_mutex_lock(&g_bigLock);
+    for (const BigAlloc& a : g_big) {
+        if (!a.ptr)
+            continue;
+        total += a.size;
+        int i = 0;
+        while (i < n && memcmp(sums[i].where, a.where, sizeof a.where) != 0)
+            i++;
+        if (i == n) {
+            if (n == 256)
+                continue;
+            memcpy(sums[n].where, a.where, sizeof a.where);
+            sums[n].bytes = 0, sums[n].count = 0;
+            n++;
+        }
+        sums[i].bytes += a.size, sums[i].count++;
+    }
+    untracked = g_bigUntracked;
+    pthread_mutex_unlock(&g_bigLock);
+    size_t used = 0;
+    int lines = 0;
+    used += snprintf(out + used, size - used, "app heap: %zu MiB in allocations of 1 MiB or more (%zu MiB untracked)\n",
+                     total / MB, untracked / MB);
+    lines++;
+    for (int k = 0; k < 10 && used < size; k++) {
+        int best = -1;
+        for (int i = 0; i < n; i++)
+            if (sums[i].count && (best < 0 || sums[i].bytes > sums[best].bytes))
+                best = i;
+        if (best < 0)
+            break;
+        const Sum& b = sums[best];
+        used += snprintf(out + used, size - used, "app heap:   %zu MiB in %d from elf 0x%x < 0x%x < 0x%x < 0x%x < 0x%x\n",
+                         b.bytes / MB, b.count, b.where[0], b.where[1], b.where[2], b.where[3], b.where[4]);
+        sums[best].count = 0;
+        lines++;
+    }
+    return lines;
 }
 
 // Diagnostics.

@@ -10,25 +10,45 @@ from your dump contains your game's code, so it is for your console only.
 
 ## Status
 
-**Early work. The game doesn't run yet.**
+**It plays, far too slowly: 2-10 fps.** Development stopped at v00.72 (2026-10-24).
 
-| Step | State |
-|---|---|
-| Runtime with three code modules (`main`, `subsdk0`, `sdk`) | done |
-| Separate PS4 app (`TOTK00001`, data in `/data/TOTK`), own art | done |
-| Runtime builds and packages against stub modules (`TOTK-v00.00`) | done, a smoke test only |
-| zstd dictionary support in the shader extractor | done, untested on real data |
-| Import, recompile and translate the shaders from a TOTK 1.0.0 dump | waiting for a dump |
-| Switch services, NVN features and patches TOTK needs beyond Wonder | to do |
-| Boot to the title screen on a PS4 | to do |
+Tested on the console:
+
+- It boots to the title screen and plays the opening movie (VP9 through FFmpeg).
+- It loads a save (about 2 minutes) and plays the Great Sky Island with correct lighting, shadows, text and sound.
+- The game's memory doesn't fit in the PS4's 4.5 GB of direct memory beside the GPU's copies. A memory manager maps
+  64 KiB chunks on first touch and compresses cold ones in RAM with zstd.
+- An in-game menu (L3+R3) sets the render resolution, FSR 1 upscaling, the frame counter, the CPU core layout,
+  multi-core draw recording and the pass statistics.
+
+Why it is slow, as measured on the console:
+
+- The GPU is busy only about 10 ms a frame. The CPU is the limit.
+- Every NVN draw is replayed through Vulkan and RADV on one Jaguar core, at 65-90 µs a draw. TOTK draws 1,000-2,300
+  times a frame, so the replay takes 80-190 ms.
+- The cost is spread over many small steps; none is above about 2% of the replay.
+- The game's own logic takes about 35-70 ms in its slower frames.
+- Multi-core draw recording (from the Breath of the Wild port) lost time in TOTK: the game rewrites uniform data
+  inside its passes about 38 times a frame, and each rewrite makes the replay wait for every worker.
+
+20 fps would need a different renderer, writing the PS4's GPU commands directly or translating draws on several
+cores where the game records them, and faster recompiled code.
+
+Settings in `/data/TOTK/config.txt` that trade quality for speed:
+
+- `NX_PASS_EVERY` draws chosen render passes only every n-th frame, for example the shadow cascades:
+  `d0 360x360 vk124 layer 1/4=2;c0 256x144 vk37, d0 256x144 vk126=2@1`. The pass names come from the pass
+  statistics in `nx.log` (`NX_PASS_STATS`).
+- `NX_PARALLEL=1` turns on multi-core draw recording; it is off by default.
+- `NX_KERNEL_SPIN_US` sets how long a kernel wait spins before sleeping (50 by default, 0 turns it off).
+- `NX_WRITE_WATCH=0` turns off page-protection tracking of CPU-written textures.
 
 ### What makes TOTK harder than Wonder
 
 - **Memory.** The Switch gives the game about 3.2 GB, and the PS4 port also keeps GPU copies of textures. A PS4 app
   gets about 5 GB, and SMW already ran short of direct memory in courses.
-- **CPU.** SMW replays about 600 draws a frame in about 25 ms on one Jaguar core. Hyrule draws many more, so the
-  NVN replay will need to run on more than one core.
-- **Storage.** The RomFS is about 16 GB and is streamed while you play. The PS4's drive read at 5-27 MB/s in
+- **CPU.** SMW replays about 600 draws a frame in about 25 ms on one Jaguar core. TOTK draws 1,000-2,300.
+- **Storage.** The RomFS is about 17 GB and is streamed while you play. The PS4's drive read at 5-27 MB/s in
   SMW's tests.
 
 ## Building

@@ -9,3 +9,5 @@ build/
 *.nsp
 *.keys
 private/
+# captures of the game (footage, not source)
+clips/

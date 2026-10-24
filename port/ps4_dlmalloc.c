@@ -9,6 +9,12 @@
 #define ONLY_MSPACES 1
 #define MSPACES 1
 #define USE_LOCKS 1
+/* Sleeping (pthread) locks, not dlmalloc's x86 default of spin locks that sched_yield every 63 spins: on the PS4's
+ * fixed-priority, per-core scheduling a yield only gives way to equal or higher priorities, so a lower-priority thread
+ * holding an arena's lock could be kept off its core by the threads spinning for it. TOTK froze that way (v00.33,
+ * v00.38, v00.39: threads stuck in malloc/free, and with them every thread behind nvn's objects_lock, held by one that
+ * was allocating). */
+#define USE_SPIN_LOCKS 0
 #define HAVE_MMAP 0
 #define HAVE_MREMAP 0
 #define HAVE_MORECORE 0

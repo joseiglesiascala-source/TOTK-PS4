@@ -110,6 +110,9 @@ set(PS4_NETFS_WRAPS --wrap=open --wrap=close)
 foreach (fn read _read readv _readv pread lseek fstat stat getdents)
     list(APPEND PS4_NETFS_WRAPS --wrap=${fn})
 endforeach ()
+# Waits of at most 50 ms for every pthread_cond_wait (port/ps4_runtime.cpp): on the PS4 a wake-up can be lost, and
+# that now costs 50 ms instead of a frozen thread (FFmpeg's movie decoder, libc++, Mesa, the runtime). App only too.
+list(APPEND PS4_NETFS_WRAPS --wrap=pthread_cond_wait)
 
 # Program authority ID: the system Piglet (OpenGL ES) only gives a display to processes with a
 # system authority ID. This is RetroArch for PS4's value, as used by love-ps4.
