@@ -19,7 +19,7 @@
 #define HAVE_MREMAP 0
 #define HAVE_MORECORE 0
 #define FOOTERS 1
-#define INSECURE 0
+#define INSECURE 1
 #define USE_DEV_RANDOM 0
 #define NO_MALLINFO 1
 #define NO_MALLOC_STATS 1
