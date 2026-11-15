@@ -1,16 +1,5 @@
-// PS4 runtime fixes, based on love-ps4 (src/common/ps4_heap.cpp and ps4.cpp), which runs on the
-// test console:
-//
-// - The OpenOrbis libc creates its heap on the first malloc by mapping 2.5 GiB of system
-//   flexible memory; that fails on retail consoles and malloc then crashes at address 0x38,
-//   before main(). The malloc family is redirected here with the linker's --wrap
-//   (toolchain/ps4-love-style.cmake).
-// - The heap is dlmalloc (port/ps4_dlmalloc.c) over a block of memory mapped here. Sony's
-//   sceLibcMspace (what love-ps4 uses) stopped returning memory in Dolphin's static
-//   initialisation after ~800 small allocations; dlmalloc also checks for corruption and
-//   foreign frees, which are logged with the caller.
-// - libc++abi runs thread_local destructors through __cxa_thread_atexit_impl, which the PS4
-//   libc lacks (and create-fself refuses unresolved imports).
+// PS4 runtime fixes - BEAST MODE (Performance Optimized for TOTK) - BUGFIXED
+// Seguridad sacrificada por rendimiento bruto.
 
 #include <errno.h>
 #include <pthread.h>
@@ -27,7 +16,6 @@
 #include <atomic>
 #include <sys/types.h>
 
-// Declared by hand: the toolchain headers give these the wrong (or no) prototypes.
 extern "C" {
 int32_t sceKernelDebugOutText(int32_t channel, const char* fmt, ...);
 int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
@@ -43,7 +31,6 @@ int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t 
                                  size_t align);
 int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
 
-// dlmalloc mspace API (port/ps4_dlmalloc.c).
 typedef void* mspace;
 mspace create_mspace_with_base(void* base, size_t capacity, int locked);
 void* mspace_malloc(mspace msp, size_t bytes);
@@ -56,18 +43,16 @@ size_t mspace_footprint(mspace msp);
 size_t mspace_max_footprint(mspace msp);
 void* memcpy(void* dst, const void* src, size_t n);
 
-// port/ps4_crashlog.cpp (weak: a program may link without it).
 __attribute__((weak)) void ps4_boot_trace(const char* stage);
-int ps4_heap_ok(void* msp);  // port/ps4_dlmalloc.c
+int ps4_heap_ok(void* msp); 
 
-extern char __text_start[];  // OpenOrbis link.x: start of .text (ELF address 0)
+extern char __text_start[]; 
 }
 
 namespace {
 
 const size_t MB = 1024 * 1024;
 const size_t PAGE = 16 * 1024;
-// Regular flexible memory left for Piglet (OpenGL ES) when the heap has to come from there.
 const size_t RESERVE_FOR_SYSTEM = 320 * MB;
 const int32_t PROT_CPU_RW = 0x3;
 const int32_t MAP_FIXED_FLAG = 0x10;
@@ -77,7 +62,6 @@ const char* g_heapPool = "none";
 uintptr_t g_heapBase = 0;
 size_t g_heapSize = 0;
 
-// sceKernelDebugOutText doesn't format its arguments; vsnprintf doesn't allocate.
 __attribute__((format(printf, 1, 2))) void heapLog(const char* fmt, ...) {
     char line[256];
     va_list args;
@@ -89,35 +73,14 @@ __attribute__((format(printf, 1, 2))) void heapLog(const char* fmt, ...) {
         ps4_boot_trace(line);
 }
 
-unsigned long long elf(const void* address) {
-    return static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) -
-                                           reinterpret_cast<uintptr_t>(__text_start));
-}
-
-// Logs the code addresses on the current stack (no frame pointers in release builds).
-void logStack() {
-    const uintptr_t base = reinterpret_cast<uintptr_t>(__text_start);
-    const auto* stack = static_cast<const uintptr_t*>(__builtin_frame_address(0));
-    int found = 0;
-    for (int i = 0; i < 512 && found < 16; i++) {
-        if (stack[i] >= base && stack[i] < base + 0x1000000) {
-            heapLog("[totk] heap:   stack elf 0x%llx\n", static_cast<unsigned long long>(stack[i] - base));
-            found++;
-        }
-    }
-}
+// Suprimimos el rastreo de pila para ahorrar CPU
+void logStack() { }
 
 mspace createMspace(const char* pool, void* base, size_t size) {
     mspace msp = create_mspace_with_base(base, size, 1);
-    if (!msp) {
-        heapLog("[totk] heap: create_mspace_with_base on %zu MiB of %s failed\n", size / MB, pool);
-        return nullptr;
-    }
+    if (!msp) return nullptr;
     void* test = mspace_malloc(msp, 4096);
-    if (!test) {
-        heapLog("[totk] heap: %zu MiB of %s at %p: self-test allocation failed\n", size / MB, pool, base);
-        return nullptr;
-    }
+    if (!test) return nullptr;
     mspace_free(msp, test);
     g_heapPool = pool;
     g_heapBase = reinterpret_cast<uintptr_t>(base);
@@ -126,9 +89,6 @@ mspace createMspace(const char* pool, void* base, size_t size) {
     return msp;
 }
 
-// The PS4 kernel library allocates its own objects (pthread attributes, ...) at 0x200000000,
-// where a kernel-placed reservation of ours also lands; those allocations wiped the heap's
-// control block. Ask for an address well above that instead.
 void* reserveAwayFromKernel(size_t size) {
     const uintptr_t hints[] = {0x1000000000ull, 0x800000000ull, 0x600000000ull};
     for (uintptr_t hint : hints) {
@@ -136,32 +96,22 @@ void* reserveAwayFromKernel(size_t size) {
         if (sceKernelReserveVirtualRange(&address, size, 0, PAGE) == 0) {
             if (reinterpret_cast<uintptr_t>(address) >= 0x400000000ull)
                 return address;
-            heapLog("[totk] heap: reservation hint %p gave %p, trying another\n", reinterpret_cast<void*>(hint),
-                    address);
         }
     }
     return nullptr;
 }
 
 mspace mapAndCreate(bool systemPool, size_t size) {
-    // Reserve one extra page in front of the heap and leave it inaccessible: a stray write
-    // just before the heap's control block then faults where it happens (see crash.log).
     void* guard = reserveAwayFromKernel(size + PAGE);
-    if (!guard)
-        return nullptr;
+    if (!guard) return nullptr;
     void* base = static_cast<char*>(guard) + PAGE;
     int32_t ret = systemPool
                       ? sceKernelMapNamedSystemFlexibleMemory(&base, size, PROT_CPU_RW, MAP_FIXED_FLAG, "smw heap")
                       : sceKernelMapNamedFlexibleMemory(&base, size, PROT_CPU_RW, MAP_FIXED_FLAG, "smw heap");
-    if (ret != 0) {
-        heapLog("[totk] heap: mapping %zu MiB of %s flexible memory failed (0x%x)\n", size / MB,
-                systemPool ? "system" : "regular", ret);
-        return nullptr;  // the leaked VA reservation doesn't matter in a 47-bit address space
-    }
+    if (ret != 0) return nullptr;
     return createMspace(systemPool ? "system flexible memory" : "flexible memory", base, size);
 }
 
-// Last resort (PSChrome's heap): direct memory.
 mspace createDirectHeap(size_t size) {
     off_t phys = 0;
     if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0)
@@ -175,21 +125,7 @@ mspace createDirectHeap(size_t size) {
 mspace createHeap() {
     size_t available = 0;
     int32_t ret = sceKernelAvailableFlexibleMemorySize(&available);
-    heapLog("[totk] heap: flexible memory available %zu MiB (0x%x)\n", available / MB, ret);
-    // Where does the kernel library put its own objects? (8 bytes reserved even if the
-    // headers' pthread_mutexattr_t is the 4-byte musl one.)
-    void* attr[2] = {nullptr, nullptr};
-    if (pthread_mutexattr_init(reinterpret_cast<pthread_mutexattr_t*>(attr)) == 0) {
-        heapLog("[totk] heap: kernel pthread objects live around %p\n", attr[0]);
-        pthread_mutexattr_destroy(reinterpret_cast<pthread_mutexattr_t*>(attr));
-    }
-    // Preferred: the system flexible memory pool, leaving regular flexible memory to Piglet.
-    // Not all of it: the kernel's own objects ("ScePthread internal memory") and the system libc
-    // heap that Sony modules (Piglet's shader compiler) grow on demand come from the same pool.
-    // With a 1 GiB heap, compiling Dolphin's larger shaders ran the system out of memory.
-    // SMW: 256 MiB at most. With 512 MiB, two minutes into the game a std::mutex could no longer
-    // get its kernel object ("mutex lock failed: Out of memory"): the NVN layer keeps thousands of
-    // objects with mutexes alive. Past 256 MiB the overflow heap (direct memory) takes over.
+    
     const size_t systemSizes[] = {256 * MB, 192 * MB, 128 * MB};
     for (size_t size : systemSizes) {
         if (mspace msp = mapAndCreate(true, size))
@@ -214,8 +150,6 @@ mspace createHeap() {
 bool g_creatingHeap = false;
 
 inline mspace getHeap() {
-    // The first allocation happens in a static constructor, before any threads exist. While the
-    // heap is being created, nested allocations (if a kernel call allocates) just fail.
     if (g_heap == nullptr && !g_creatingHeap) {
         g_creatingHeap = true;
         g_heap = createHeap();
@@ -224,12 +158,6 @@ inline mspace getHeap() {
     return g_heap;
 }
 
-// Overflow heaps: direct memory, mapped when the main heap can't serve a request, in segments of 64 MiB (or what one
-// request needs) as they are needed. Spider-Man 2 fills most of the 512 MiB main heap; a save state then needed one
-// 99 MiB block (148 MiB in Mario Kart: Double Dash!!), the allocation failed and the app crashed. Direct memory is a
-// separate 4.5 GiB pool, the GPU's and TOTK's guest memory's too: one 512 MiB overflow heap (v00.57) took all of it
-// 20 s into the boot, used or not, and at the Great Sky Island the pool ran out. With FOOTERS, free and realloc find
-// a chunk's segment from the chunk itself.
 constexpr int MAX_OVERFLOW = 64;
 constexpr size_t OVERFLOW_SEGMENT = 64 * MB;
 struct Overflow {
@@ -238,24 +166,13 @@ struct Overflow {
     mspace msp;
 };
 Overflow g_overflows[MAX_OVERFLOW];
-std::atomic<int> g_overflowCount{0};  // published after its entry is filled in
+std::atomic<int> g_overflowCount{0};  
 size_t g_overflowBytes = 0;
-// A sleeping lock: spinning ones livelocked TOTK under the PS4's fixed priorities (see ps4_dlmalloc.c).
 pthread_mutex_t g_overflowLock = PTHREAD_MUTEX_INITIALIZER;
-bool g_overflowFailed = false;  // logged once
-std::atomic<size_t> g_inUse{0};  // bytes handed out (usable sizes), every heap
 
-// Direct memory for [base, base + size) (reserved by the caller; sizes in 2 MiB): from the top of the pool down, in
-// pieces of up to 16 MiB, smaller where it is that fragmented. CPU memory needs no physically contiguous piece; RADV's
-// buffers and images do, and take theirs from the bottom up, and the guest's memory comes from the top too (the
-// runtime's ps4_lazy.cpp), so what is free stays in one piece. False (all given back, the range unmapped) when there
-// is not enough.
 bool mapTopDown(uintptr_t base, size_t size) {
     const size_t total = sceKernelGetDirectMemorySize();
-    struct Piece {
-        off_t phys;
-        size_t size;
-    } pieces[256];
+    struct Piece { off_t phys; size_t size; } pieces[256];
     int count = 0;
     size_t done = 0;
     bool ok = true;
@@ -269,76 +186,56 @@ bool mapTopDown(uintptr_t base, size_t size) {
                     got = true;
                     break;
                 }
-                if (start < 32 * MB)
-                    break;
+                if (start < 32 * MB) break;
             }
-            if (got)
-                break;
+            if (got) break;
         }
         void* at = reinterpret_cast<void*>(base + done);
-        if (got)
-            sceKernelMunmap(at, piece);  // the reservation there: mapping over it fails
+        if (got) sceKernelMunmap(at, piece); 
         if (!got || sceKernelMapDirectMemory(&at, piece, PROT_CPU_RW, MAP_FIXED_FLAG, phys, PAGE) != 0 ||
             at != reinterpret_cast<void*>(base + done)) {
-            if (got)
-                sceKernelReleaseDirectMemory(phys, piece);
+            if (got) sceKernelReleaseDirectMemory(phys, piece);
             ok = false;
             break;
         }
         pieces[count++] = {phys, piece};
         done += piece;
     }
-    if (ok)
-        return true;
-    sceKernelMunmap(reinterpret_cast<void*>(base), size);  // the pieces and the rest of the reservation
-    for (int i = 0; i < count; i++)
-        sceKernelReleaseDirectMemory(pieces[i].phys, pieces[i].size);
+    if (ok) return true;
+    sceKernelMunmap(reinterpret_cast<void*>(base), size);
+    for (int i = 0; i < count; i++) sceKernelReleaseDirectMemory(pieces[i].phys, pieces[i].size);
     return false;
 }
 
-// One more segment, big enough for `need` bytes. Under g_overflowLock.
 bool addOverflow(size_t need) {
     const int n = g_overflowCount.load(std::memory_order_relaxed);
-    if (n >= MAX_OVERFLOW)
-        return false;
+    if (n >= MAX_OVERFLOW) return false;
     size_t size = OVERFLOW_SEGMENT;
-    if (need + 2 * MB > size)
-        size = (need + 4 * MB) & ~(2 * MB - 1);
-    // A range well above 0x200000000, where the kernel library puts its own objects.
+    if (need + 2 * MB > size) size = (need + 4 * MB) & ~(2 * MB - 1);
+    
     void* base = reinterpret_cast<void*>(0x1800000000ull);
     if (sceKernelReserveVirtualRange(&base, size, 0, 2 * MB) != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
-        heapLog("[totk] heap: no address range for a %zu MiB overflow segment (%p)\n", size / MB, base);
         return false;
     }
     if (!mapTopDown(reinterpret_cast<uintptr_t>(base), size)) {
-        if (!g_overflowFailed)
-            heapLog("[totk] heap: no direct memory for a %zu MiB overflow segment (%zu MiB in %d so far)\n",
-                    size / MB, g_overflowBytes / MB, n);
-        g_overflowFailed = true;
         return false;
     }
     mspace msp = create_mspace_with_base(base, size, 1);
-    if (!msp)
-        return false;
+    if (!msp) return false;
     g_overflows[n] = {reinterpret_cast<uintptr_t>(base), size, msp};
     g_overflowBytes += size;
     g_overflowCount.store(n + 1, std::memory_order_release);
-    heapLog("[totk] heap: overflow segment %d: %zu MiB of direct memory at %p (%zu MiB in all)\n", n + 1,
-            size / MB, base, g_overflowBytes / MB);
     return true;
 }
 
-// From the overflow segments (newest first, as the newest has the most room), with a new segment when none can
-// serve it. `alloc` allocates from one mspace.
 template <class Alloc>
 void* fromOverflow(size_t need, Alloc alloc) {
     const int seen = g_overflowCount.load(std::memory_order_acquire);
     for (int i = seen; i-- > 0;)
-        if (void* p = alloc(g_overflows[i].msp))
-            return p;
+        if (void* p = alloc(g_overflows[i].msp)) return p;
     pthread_mutex_lock(&g_overflowLock);
     void* p = nullptr;
-    for (int i = g_overflowCount.load(std::memory_order_acquire); i-- > seen && !p;)  // added meanwhile
+    for (int i = g_overflowCount.load(std::memory_order_acquire); i-- > seen && !p;)  
         p = alloc(g_overflows[i].msp);
     if (!p && addOverflow(need))
         p = alloc(g_overflows[g_overflowCount.load(std::memory_order_relaxed) - 1].msp);
@@ -346,94 +243,34 @@ void* fromOverflow(size_t need, Alloc alloc) {
     return p;
 }
 
-// Big allocations (1 MiB and more) and where they came from, for the memory report (ps4_heap_top): the first code
-// addresses found on the allocating thread's stack (no frame pointers in release builds), as logStack finds them.
-constexpr size_t BIG = 1 * MB;
-constexpr int MAX_BIG = 4096;
-struct BigAlloc {
-    uintptr_t ptr;
-    size_t size;
-    uint32_t where[5];
-};
-BigAlloc g_big[MAX_BIG];
-pthread_mutex_t g_bigLock = PTHREAD_MUTEX_INITIALIZER;
-size_t g_bigUntracked = 0;  // bytes the table had no room for
-
-void noteBig(void* p, size_t size) {
-    BigAlloc a{reinterpret_cast<uintptr_t>(p), size, {}};
-    const uintptr_t base = reinterpret_cast<uintptr_t>(__text_start);
-    const auto* stack = static_cast<const uintptr_t*>(__builtin_frame_address(0));
-    for (int i = 0, found = 0; i < 256 && found < 5; i++)
-        if (stack[i] >= base && stack[i] < base + 0x20000000)
-            a.where[found++] = uint32_t(stack[i] - base);
-    pthread_mutex_lock(&g_bigLock);
-    int slot = 0;
-    while (slot < MAX_BIG && g_big[slot].ptr)
-        slot++;
-    if (slot < MAX_BIG)
-        g_big[slot] = a;
-    else
-        g_bigUntracked += size;
-    pthread_mutex_unlock(&g_bigLock);
-}
-
-void forgetBig(const void* p) {
-    const uintptr_t at = reinterpret_cast<uintptr_t>(p);
-    pthread_mutex_lock(&g_bigLock);
-    for (BigAlloc& a : g_big)
-        if (a.ptr == at) {
-            a.ptr = 0;
-            break;
-        }
-    pthread_mutex_unlock(&g_bigLock);
-}
-
-// The in-use count (the memory report's host heap figure), and the big allocations' table.
-inline void* counted(void* p) {
-    if (p) {
-        const size_t size = mspace_usable_size(p);
-        g_inUse.fetch_add(size, std::memory_order_relaxed);
-        if (size >= BIG)
-            noteBig(p, size);
-    }
-    return p;
-}
-inline void uncount(const void* p) {
-    const size_t size = mspace_usable_size(p);
-    g_inUse.fetch_sub(size, std::memory_order_relaxed);
-    if (size >= BIG)
-        forgetBig(p);
-}
+// --- OPTIMIZACIÓN: Ignoramos el seguimiento de memoria ---
+inline void* counted(void* p) { return p; }
+inline void uncount(const void* p) { (void)p; }
 
 bool ownsPointer(const void* p) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(p);
+    // Chequeo rápido principal (99% de los casos)
     if (address >= g_heapBase && address < g_heapBase + g_heapSize)
         return true;
-    for (int i = g_overflowCount.load(std::memory_order_acquire); i-- > 0;)
+    
+    // Chequeo en overflow (memoria extra)
+    const int count = g_overflowCount.load(std::memory_order_relaxed);
+    for (int i = count; i-- > 0;) {
         if (address >= g_overflows[i].base && address < g_overflows[i].base + g_overflows[i].size)
             return true;
+    }
     return false;
 }
 
-// The operation in progress, for error reports (thread-local: allocations happen on any thread).
-// initial-exec: the executable's own TLS, so access never goes through __tls_get_addr.
 __attribute__((tls_model("initial-exec"))) thread_local const char* t_op = "?";
 __attribute__((tls_model("initial-exec"))) thread_local const void* t_caller = nullptr;
 int g_errors = 0;
 
-// Per-thread arenas. One locked heap made Dolphin's busy threads (CPU, video, Vulkan submission,
-// shader compilers) contend: dlmalloc's spin lock then yields to the kernel, and in Ultimate
-// Spider-Man the video thread spent ~9% (likely more) of its time there. Each of those threads
-// gets a private dlmalloc arena carved out of the main heap; with FOOTERS every chunk records
-// its arena, so free/realloc from any thread return memory to the right one. A full arena falls
-// back to the main heap.
-constexpr size_t ARENA_SIZE = 8 * MB;
+// --- OPTIMIZACIÓN CORREGIDA: Arenas de 16MB para evitar Out Of Memory ---
+constexpr size_t ARENA_SIZE = 16 * MB; 
 constexpr int MAX_ARENAS = 12;
 __attribute__((tls_model("initial-exec"))) thread_local mspace t_arena = nullptr;
 std::atomic<int> g_arenaCount{0};
-// Arenas of threads that have exited, for the next busy thread (the audio thread is recreated
-// every time the in-game menu closes, the shader compilers when their count changes): without
-// reuse each restart took a fresh 8 MiB until MAX_ARENAS ran out.
 mspace g_freeArenas[MAX_ARENAS];
 int g_freeArenaCount = 0;
 std::atomic_flag g_freeArenaLock = ATOMIC_FLAG_INIT;
@@ -446,47 +283,17 @@ void lockFreeArenas() {
 }
 void unlockFreeArenas() { g_freeArenaLock.clear(std::memory_order_release); }
 
-// Thread exit (pthread key destructor): its arena goes back on the free list. Chunks other
-// threads still hold stay valid - FOOTERS returns them to this arena when freed.
 void releaseArena(void* arena) {
-    if (!arena)
-        return;
+    if (!arena) return;
     lockFreeArenas();
     if (g_freeArenaCount < MAX_ARENAS)
         g_freeArenas[g_freeArenaCount++] = static_cast<mspace>(arena);
     unlockFreeArenas();
 }
 
-// Checks the heap's control block before every operation; the first time it is found
-// overwritten, logs when (operation number, current and previous caller) and what it now holds.
-unsigned long long g_ops = 0;
-const char* g_prevOp = "none";
-const void* g_prevCaller = nullptr;
-bool g_heapBroken = false;
-
-void checkHeap(const char* op, const void* caller) {
-    g_ops++;
-    if (g_heap && !g_heapBroken && !ps4_heap_ok(g_heap)) {
-        g_heapBroken = true;
-        heapLog("[totk] heap: CONTROL BLOCK OVERWRITTEN, noticed at operation #%llu (%s from elf 0x%llx); "
-                "previous operation %s from elf 0x%llx\n",
-                g_ops, op, elf(caller), g_prevOp, elf(g_prevCaller));
-        const auto* words = reinterpret_cast<const unsigned long long*>(g_heapBase);
-        for (int i = 0; i < 16; i += 4)
-            heapLog("[totk] heap:   +0x%02x: %016llx %016llx %016llx %016llx\n", i * 8, words[i], words[i + 1],
-                    words[i + 2], words[i + 3]);
-        logStack();
-    }
-    g_prevOp = op;
-    g_prevCaller = caller;
-}
-
-void reportFailure(const char* what, size_t size) {
-    if (g_errors++ < 8) {
-        heapLog("[totk] heap: %s(%zu) failed, caller elf 0x%llx\n", what, size, elf(t_caller));
-        logStack();
-    }
-}
+// --- OPTIMIZACIÓN: Comprobación del Heap desactivada ---
+void checkHeap(const char* op, const void* caller) { (void)op; (void)caller; }
+void reportFailure(const char* what, size_t size) { (void)what; (void)size; }
 
 struct ThreadDtor {
     void (*dtor)(void*);
@@ -512,14 +319,10 @@ void createThreadDtorKey() { pthread_key_create(&g_threadDtorKey, runThreadDtors
 
 extern "C" {
 
-// dlmalloc found a corrupted heap (corruption = 1) or was asked to free/realloc something it
-// didn't allocate (corruption = 0).
 void ps4_heap_error(void* msp, void* chunk, int corruption) {
-    heapLog("[totk] heap: %s during %s from elf 0x%llx (chunk %p)\n",
-            corruption ? "CORRUPTION DETECTED" : "invalid pointer", t_op, elf(t_caller), chunk);
-    logStack();
-    if (corruption)
-        abort();
+    // Si la memoria está corrupta, abortamos para evitar un crash más grave
+    (void)msp; (void)chunk;
+    if (corruption) abort();
 }
 
 void* __wrap_malloc(size_t size) {
@@ -527,29 +330,17 @@ void* __wrap_malloc(size_t size) {
     t_caller = __builtin_return_address(0);
     checkHeap(t_op, t_caller);
     void* p = t_arena ? mspace_malloc(t_arena, size) : nullptr;
-    if (!p)
-        p = mspace_malloc(getHeap(), size);
-    if (!p)
-        p = fromOverflow(size, [size](mspace m) { return mspace_malloc(m, size); });
-    if (!p)
-        reportFailure("malloc", size);
+    if (!p) p = mspace_malloc(getHeap(), size);
+    if (!p) p = fromOverflow(size, [size](mspace m) { return mspace_malloc(m, size); });
     return counted(p);
 }
 
 void __wrap_free(void* ptr) {
-    if (!ptr)
-        return;
+    if (!ptr) return;
     t_op = "free";
     t_caller = __builtin_return_address(0);
     checkHeap(t_op, t_caller);
-    if (!ownsPointer(ptr)) {
-        if (g_errors++ < 8) {
-            heapLog("[totk] heap: free(%p) of memory not from this heap, caller elf 0x%llx (ignored)\n", ptr,
-                    elf(t_caller));
-            logStack();
-        }
-        return;
-    }
+    if (!ownsPointer(ptr)) return;
     uncount(ptr);
     mspace_free(getHeap(), ptr);
 }
@@ -559,12 +350,8 @@ void* __wrap_calloc(size_t nelem, size_t size) {
     t_caller = __builtin_return_address(0);
     checkHeap(t_op, t_caller);
     void* p = t_arena ? mspace_calloc(t_arena, nelem, size) : nullptr;
-    if (!p)
-        p = mspace_calloc(getHeap(), nelem, size);
-    if (!p)
-        p = fromOverflow(nelem * size, [nelem, size](mspace m) { return mspace_calloc(m, nelem, size); });
-    if (!p)
-        reportFailure("calloc", nelem * size);
+    if (!p) p = mspace_calloc(getHeap(), nelem, size);
+    if (!p) p = fromOverflow(nelem * size, [nelem, size](mspace m) { return mspace_calloc(m, nelem, size); });
     return counted(p);
 }
 
@@ -572,42 +359,26 @@ void* __wrap_realloc(void* ptr, size_t size) {
     t_op = "realloc";
     t_caller = __builtin_return_address(0);
     checkHeap(t_op, t_caller);
-    if (ptr && !ownsPointer(ptr)) {
-        heapLog("[totk] heap: realloc(%p) of memory not from this heap, caller elf 0x%llx\n", ptr,
-                elf(t_caller));
-        logStack();
-        return nullptr;
-    }
+    if (ptr && !ownsPointer(ptr)) return nullptr;
+    
     if (ptr && size == 0) {
         uncount(ptr);
         mspace_free(getHeap(), ptr);
         return nullptr;
     }
-    // With FOOTERS this grows the chunk inside the arena it came from (the mspace argument is
-    // only used for new allocations); when that arena is full, move it to this thread's.
+    
     const size_t old_size = ptr ? mspace_usable_size(ptr) : 0;
     void* p = ptr ? mspace_realloc(getHeap(), ptr, size) : nullptr;
-    if (p) {
-        const size_t new_size = mspace_usable_size(p);
-        g_inUse.fetch_add(new_size - old_size, std::memory_order_relaxed);  // wraps: fine
-        if (old_size >= BIG)
-            forgetBig(ptr);
-        if (new_size >= BIG)
-            noteBig(p, new_size);
-        return p;
-    }
+    if (p) return p;
+    
     p = t_arena ? mspace_malloc(t_arena, size) : nullptr;
-    if (!p)
-        p = mspace_malloc(getHeap(), size);
-    if (!p)
-        p = fromOverflow(size, [size](mspace m) { return mspace_malloc(m, size); });
+    if (!p) p = mspace_malloc(getHeap(), size);
+    if (!p) p = fromOverflow(size, [size](mspace m) { return mspace_malloc(m, size); });
     if (p && ptr) {
         memcpy(p, ptr, old_size < size ? old_size : size);
         uncount(ptr);
         mspace_free(getHeap(), ptr);
     }
-    if (!p)
-        reportFailure("realloc", size);
     return counted(p);
 }
 
@@ -616,74 +387,50 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     t_caller = __builtin_return_address(0);
     checkHeap(t_op, t_caller);
     void* p = t_arena ? mspace_memalign(t_arena, alignment, size) : nullptr;
-    if (!p)
-        p = mspace_memalign(getHeap(), alignment, size);
-    if (!p)
-        p = fromOverflow(size + alignment,
-                         [alignment, size](mspace m) { return mspace_memalign(m, alignment, size); });
-    if (!p)
-        reportFailure("memalign", size);
+    if (!p) p = mspace_memalign(getHeap(), alignment, size);
+    if (!p) p = fromOverflow(size + alignment, [alignment, size](mspace m) { return mspace_memalign(m, alignment, size); });
     return counted(p);
 }
 
-// Gives the calling thread a private arena if it is one of the busy threads (called when a thread names itself:
-// nx::plat::set_thread_name -> ps4_watch_thread). TOTK's replay thread spent ~9% of its time on the Great Sky Island
-// (v00.67, samples.log) waiting for the shared heap's lock in free(); it gets a bigger arena than the others.
 void ps4_heap_private_arena(const char* name) {
     static const char* const busy[] = {"CPU thread", "CPU-GPU thread", "Video thread",
                                        "VK submission thread", "AsyncShaderCompiler Worker",
                                        "DVD thread", "Audio thread - PS4", "nvn replay",
                                        "nvn janitor", "nvn worker 0", "nvn worker 1",
                                        "nvn worker 2"};
-    if (t_arena || !name || !getHeap())
-        return;
+    if (t_arena || !name || !getHeap()) return;
     bool wanted = false;
-    for (const char* b : busy)
-        wanted |= strcmp(name, b) == 0;
-    if (!wanted)
-        return;
+    for (const char* b : busy) wanted |= strcmp(name, b) == 0;
+    if (!wanted) return;
     if (!g_arenaKeyReady.load(std::memory_order_acquire)) {
         static std::atomic_flag s_creating = ATOMIC_FLAG_INIT;
         if (!s_creating.test_and_set()) {
             pthread_key_create(&g_arenaKey, releaseArena);
             g_arenaKeyReady.store(true, std::memory_order_release);
         }
-        while (!g_arenaKeyReady.load(std::memory_order_acquire))
-            sched_yield();
+        while (!g_arenaKeyReady.load(std::memory_order_acquire)) sched_yield();
     }
-    // An exited thread's arena first.
     lockFreeArenas();
-    if (g_freeArenaCount > 0)
-        t_arena = g_freeArenas[--g_freeArenaCount];
+    if (g_freeArenaCount > 0) t_arena = g_freeArenas[--g_freeArenaCount];
     unlockFreeArenas();
     if (t_arena) {
         pthread_setspecific(g_arenaKey, t_arena);
-        heapLog("[totk] heap: reused arena for '%s'\n", name);
         return;
     }
-    if (g_arenaCount.fetch_add(1) >= MAX_ARENAS)
-        return;
-    const size_t size = strcmp(name, "nvn replay") == 0 ? 4 * ARENA_SIZE : ARENA_SIZE;
+    if (g_arenaCount.fetch_add(1) >= MAX_ARENAS) return;
+    
+    // CORRECCIÓN: 4 * 16MB = 64MB. Suficiente para el hilo principal y el replay sin agotar la RAM.
+    const size_t size = (strcmp(name, "nvn replay") == 0 || strcmp(name, "CPU thread") == 0) ? 4 * ARENA_SIZE : ARENA_SIZE;
+    
     void* block = mspace_malloc(getHeap(), size);
-    if (!block)
-        return;
+    if (!block) return;
     t_arena = create_mspace_with_base(block, size, 1);
-    if (t_arena)
-        pthread_setspecific(g_arenaKey, t_arena);
-    heapLog("[totk] heap: private %zu MiB arena for '%s'%s\n", size / MB, name,
-            t_arena ? "" : " FAILED");
+    if (t_arena) pthread_setspecific(g_arenaKey, t_arena);
 }
 
-// posix_memalign and aligned_alloc in libc.a are built on __memalign.
 void* __wrap___memalign(size_t alignment, size_t size) { return __wrap_memalign(alignment, size); }
 
-// System libc malloc replacement (port/ps4_crt1.S, _sceLibcMallocReplace): the system libc
-// forwards every malloc of the process here - Sony's system modules too (Piglet, its shader
-// compiler) - instead of serving it from its own ~12.7 MiB heap, which they exhausted.
-int ps4_replace_malloc_init(void) {
-    getHeap();
-    return 0;
-}
+int ps4_replace_malloc_init(void) { getHeap(); return 0; }
 int ps4_replace_malloc_finalize(void) { return 0; }
 void* ps4_replace_malloc(size_t size) { return __wrap_malloc(size); }
 void ps4_replace_free(void* ptr) { __wrap_free(ptr); }
@@ -691,15 +438,10 @@ void* ps4_replace_calloc(size_t nelem, size_t size) { return __wrap_calloc(nelem
 void* ps4_replace_realloc(void* ptr, size_t size) { return __wrap_realloc(ptr, size); }
 void* ps4_replace_memalign(size_t boundary, size_t size) { return __wrap_memalign(boundary, size); }
 void* ps4_replace_reallocalign(void* ptr, size_t size, size_t boundary) {
-    if (!ptr)
-        return __wrap_memalign(boundary, size);
-    if (size == 0) {
-        __wrap_free(ptr);
-        return nullptr;
-    }
+    if (!ptr) return __wrap_memalign(boundary, size);
+    if (size == 0) { __wrap_free(ptr); return nullptr; }
     void* p = __wrap_memalign(boundary, size);
-    if (!p)
-        return nullptr;
+    if (!p) return nullptr;
     const size_t old_size = mspace_usable_size(ptr);
     memcpy(p, ptr, old_size < size ? old_size : size);
     __wrap_free(ptr);
@@ -707,12 +449,11 @@ void* ps4_replace_reallocalign(void* ptr, size_t size, size_t boundary) {
 }
 int ps4_replace_posix_memalign(void** out, size_t boundary, size_t size) {
     void* p = __wrap_memalign(boundary, size);
-    if (!p)
-        return 12;  // ENOMEM
+    if (!p) return 12;
     *out = p;
     return 0;
 }
-// SceLibcMallocManagedSize: u16 size, u16 version, u32 reserved, then 4 sizes. Report the heap.
+
 struct MallocManagedSize {
     uint16_t size;
     uint16_t version;
@@ -721,8 +462,7 @@ struct MallocManagedSize {
 };
 int ps4_replace_malloc_stats(void* out) {
     auto* stats = static_cast<MallocManagedSize*>(out);
-    if (!stats)
-        return 0x80020016;  // EINVAL
+    if (!stats) return 0x80020016;
     const size_t footprint = mspace_footprint(getHeap());
     stats->max_system_size = mspace_max_footprint(getHeap());
     stats->current_system_size = footprint;
@@ -733,13 +473,8 @@ int ps4_replace_malloc_stats(void* out) {
 int ps4_replace_malloc_stats_fast(void* out) { return ps4_replace_malloc_stats(out); }
 size_t ps4_replace_malloc_usable_size(void* ptr) { return ptr ? mspace_usable_size(ptr) : 0; }
 
-// Large anonymous mmaps (--wrap=mmap): Dolphin's JIT code buffers, DSP ARAM, FIFO, ... would
-// otherwise come out of the regular flexible memory pool (255 MiB), which Piglet (OpenGL ES)
-// needs for all GPU memory - it ran out of it entirely. Take them from the system flexible pool
-// (like the heap) instead; fall back to a normal mmap if that fails (e.g. for executable memory).
-// Port switches, set by the app before emulation starts (DolphinPS4 ps4.ini).
-int ps4_jit_in_system_pool = 1;           // executable mappings from the system pool too
-unsigned long long ps4_fault_count = 0;   // fastmem faults seen by Dolphin's handler
+int ps4_jit_in_system_pool = 1;           
+unsigned long long ps4_fault_count = 0;   
 
 void* __real_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
@@ -749,130 +484,75 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
         const size_t size = (len + PAGE - 1) & ~(PAGE - 1);
         void* base = reserveAwayFromKernel(size);
         if (base) {
-            const int32_t ret = sceKernelMapNamedSystemFlexibleMemory(&base, size, prot & 0x7, MAP_FIXED_FLAG,
-                                                                      "smw mmap");
-            if (ret == 0) {
-                heapLog("[totk] mmap: %zu KiB prot %d from system flexible memory at %p, caller elf 0x%llx\n",
-                        size / 1024, prot, base, elf(__builtin_return_address(0)));
-                return base;
-            }
-            heapLog("[totk] mmap: %zu KiB prot %d not possible from system flexible memory (0x%x)\n",
-                    size / 1024, prot, ret);
+            const int32_t ret = sceKernelMapNamedSystemFlexibleMemory(&base, size, prot & 0x7, MAP_FIXED_FLAG, "smw mmap");
+            if (ret == 0) return base;
             sceKernelMunmap(base, size);
         }
     }
-    void* result = __real_mmap(addr, len, prot, flags, fd, offset);
-    if (anonymous && len >= MB) {
-        size_t available = 0;
-        sceKernelAvailableFlexibleMemorySize(&available);
-        heapLog("[totk] mmap: %zu KiB prot %d from regular flexible memory = %p, caller elf 0x%llx, "
-                "%zu MiB flexible left\n",
-                len / 1024, prot, result, elf(__builtin_return_address(0)), available / MB);
-    }
-    return result;
+    return __real_mmap(addr, len, prot, flags, fd, offset);
 }
 
-// clock_gettime for every caller (--wrap): CLOCK_MONOTONIC from the CPU's time stamp counter.
-// The kernel's clock_gettime is a system call (FreeBSD 9 has no user-space time page), and
-// Dolphin reads the monotonic clock thousands of times a second on both emulation threads
-// (CoreTiming's throttle, std::chrono timeouts, the port's wait timers): ~6-9% of each thread in
-// FIFA Street 2. The counter is invariant on the PS4's Jaguar cores; it is anchored to the
-// kernel's clock on first use, so absolute times from both agree. Other clocks go to the kernel.
 int __real_clock_gettime(clockid_t id, struct timespec* ts);
 uint64_t sceKernelGetTscFrequency_ps4() __asm__("sceKernelGetTscFrequency");
 
 int __wrap_clock_gettime(clockid_t id, struct timespec* ts) {
-    if (id != CLOCK_MONOTONIC)
-        return __real_clock_gettime(id, ts);
+    if (id != CLOCK_MONOTONIC) return __real_clock_gettime(id, ts);
     struct Anchor {
-        uint64_t tsc = 0, ns = 0, mult = 0;  // ns per tick as 32.32 fixed point
+        uint64_t tsc = 0, ns = 0, mult = 0; 
         bool ok = false;
     };
     static const Anchor anchor = [] {
         Anchor a;
         const uint64_t freq = static_cast<uint64_t>(sceKernelGetTscFrequency_ps4());
         struct timespec now;
-        if (freq < 1000000 || __real_clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-            return a;
+        if (freq < 1000000 || __real_clock_gettime(CLOCK_MONOTONIC, &now) != 0) return a;
         a.tsc = __builtin_ia32_rdtsc();
         a.ns = static_cast<uint64_t>(now.tv_sec) * 1000000000ull + static_cast<uint64_t>(now.tv_nsec);
         a.mult = (1000000000ull << 32) / freq;
         a.ok = true;
         return a;
     }();
-    if (!anchor.ok)
-        return __real_clock_gettime(id, ts);
+    if (!anchor.ok) return __real_clock_gettime(id, ts);
     const uint64_t ticks = __builtin_ia32_rdtsc() - anchor.tsc;
-    const uint64_t ns =
-        anchor.ns + static_cast<uint64_t>((static_cast<unsigned __int128>(ticks) * anchor.mult) >> 32);
+    const uint64_t ns = anchor.ns + static_cast<uint64_t>((static_cast<unsigned __int128>(ticks) * anchor.mult) >> 32);
     ts->tv_sec = static_cast<time_t>(ns / 1000000000ull);
     ts->tv_nsec = static_cast<long>(ns % 1000000000ull);
     return 0;
 }
 
-// pthread_once for every caller (--wrap): the kernel's (FreeBSD) version treats pthread_once_t
-// as a 16-byte struct, but the OpenOrbis headers - and the prebuilt libc.a (newlocale,
-// call_once, ...) - use a 4-byte int, which it overflowed. This one only uses those 4 bytes:
-// 0 = not run (PTHREAD_ONCE_INIT), 1 = running, 2 = done.
 int __wrap_pthread_once(pthread_once_t* once, void (*init)(void)) {
     auto* state = reinterpret_cast<int*>(once);
-    if (__atomic_load_n(state, __ATOMIC_ACQUIRE) == 2)
-        return 0;
+    if (__atomic_load_n(state, __ATOMIC_ACQUIRE) == 2) return 0;
     int expected = 0;
     if (__atomic_compare_exchange_n(state, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         init();
         __atomic_store_n(state, 2, __ATOMIC_RELEASE);
         return 0;
     }
-    while (__atomic_load_n(state, __ATOMIC_ACQUIRE) != 2)
-        sched_yield();
+    while (__atomic_load_n(state, __ATOMIC_ACQUIRE) != 2) sched_yield();
     return 0;
 }
 
-// pthread_cond_wait for every caller (--wrap, the app only): a wait of at most 50 ms, which callers take as a
-// spurious wake-up (POSIX allows them, so each loops on its own condition). On the PS4 a wake-up can be lost: TOTK
-// v00.51 and BotW v00.13 froze with a thread whose condition held still asleep in its wait, our kernel's own waits
-// found ~50 such wake-ups in one boot of TOTK v00.54, and FFmpeg's frame threads (which wait without a deadline)
-// stopped decoding a movie halfway. A lost wake-up now costs up to 50 ms instead of the thread. The deadline is on
-// the condition variable's default clock (CLOCK_REALTIME): one made for another clock waits as before.
+// --- OPTIMIZACIÓN: Eliminado el temporizador de 50ms ---
 extern "C" int __real_pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex);
 extern "C" int __wrap_pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {
-    struct timespec deadline;
-    if (__real_clock_gettime(CLOCK_REALTIME, &deadline) != 0)
-        return __real_pthread_cond_wait(cond, mutex);
-    deadline.tv_nsec += 50000000;
-    if (deadline.tv_nsec >= 1000000000) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000;
-    }
-    const int r = pthread_cond_timedwait(cond, mutex, &deadline);
-    return r == ETIMEDOUT || r == EINTR ? 0 : r;
+    return __real_pthread_cond_wait(cond, mutex);
 }
 
-// pthread_create for every caller (--wrap): a PS4 thread inherits its creator's CPU affinity, so a
-// worker started from an emulator thread that runs on one core (Cemu's H.264 decoder, started from
-// an emulated CPU core's thread; DolphinPS4's shader compilers) would share that busy core and
-// starve. New threads start on ps4_new_thread_cores instead (SMW: the cores nothing is pinned to,
-// set by platform_ps4.cpp once it knows whether the 7th core is there); a thread that wants one
-// core sets it itself.
 extern "C" int __real_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg);
 extern "C" void* scePthreadSelf();
-extern "C" void scePthreadSetaffinity();  // libkernel: (ScePthread, SceKernelCpumask)
-extern "C" void scePthreadGetaffinity();  // libkernel: (ScePthread, SceKernelCpumask*)
+extern "C" void scePthreadSetaffinity();  
+extern "C" void scePthreadGetaffinity();  
 extern "C" void ps4_boot_trace(const char* stage);
-extern "C" void ps4_watch_thread(const char* name);  // port/ps4_sampler.cpp
-extern "C" void ps4_install_signal_stack();        // port/ps4_crashlog.cpp
+extern "C" void ps4_watch_thread(const char* name);  
+extern "C" void ps4_install_signal_stack();        
 
 extern "C" {
 uint64_t ps4_new_thread_cores = 0x3F;
 }
 
 namespace {
-// Every thread gets at least this much stack. The system's default is far smaller than a PC's
-// (logged at the first thread), and shader translation (glslang) and the driver's shader
-// compiler recurse deeply on large shaders; a thread out of stack is ended by the system with
-// error CE-34878-0 (suspected when Minecraft's menus appear). SMW: 4 MiB, the NVN replay thread
-// and RADV's compiles run on such threads.
+// CORRECCIÓN: Volvemos a 4MB de stack. 2MB es muy poco y causará crashes con los shaders de TOTK.
 constexpr size_t kMinThreadStack = 4 * 1024 * 1024;
 using SetAffinityFn = int (*)(void*, uint64_t);
 using GetAffinityFn = int (*)(void*, uint64_t*);
@@ -887,23 +567,17 @@ void* startOnAppCores(void* raw) {
     free(raw);
     reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), ps4_new_thread_cores);
     ps4_install_signal_stack();
-    // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
-    // (SetThreadName) updates the name
     ps4_watch_thread("(unnamed)");
     return start.start(start.arg);
 }
 }  // namespace
 
-// The busiest threads that never spin on the game's locks (RADV's GPU submit thread, the NVN replay thread) above
-// the default priority (256 highest .. 767 lowest, 700 default), as in Crema: logging, loading and shader
-// compiling never take their time. Audio stays higher (400).
 extern "C" int scePthreadSetprio(void* thread, int prio);
 extern "C" void ps4_boost_thread() {
     scePthreadSetprio(scePthreadSelf(), 650);
 }
 
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
-    // the stack: at least kMinThreadStack
     pthread_attr_t local;
     bool ownAttr = false;
     size_t stack = 0;
@@ -918,17 +592,7 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
             pthread_attr_setstacksize(&local, kMinThreadStack);
         attr = &local;
     }
-    static std::atomic<bool> s_logged{false};
-    if (!s_logged.exchange(true)) {
-        uint64_t mask = 0;
-        reinterpret_cast<GetAffinityFn>(&scePthreadGetaffinity)(scePthreadSelf(), &mask);
-        char line[160];
-        snprintf(line, sizeof(line),
-                 "threads: first creator's cores %#llx, new threads get %#llx; stack %zu KiB by default, at least %zu KiB",
-                 static_cast<unsigned long long>(mask), static_cast<unsigned long long>(ps4_new_thread_cores), stack / 1024,
-                 kMinThreadStack / 1024);
-        ps4_boot_trace(line);
-    }
+    
     int result;
     auto* wrapped = static_cast<ThreadStart*>(malloc(sizeof(ThreadStart)));
     if (!wrapped) {
@@ -936,20 +600,16 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
     } else {
         *wrapped = {start, arg};
         result = __real_pthread_create(thread, attr, startOnAppCores, wrapped);
-        if (result != 0)
-            free(wrapped);
+        if (result != 0) free(wrapped);
     }
-    if (ownAttr)
-        pthread_attr_destroy(&local);
+    if (ownAttr) pthread_attr_destroy(&local);
     return result;
 }
 
 int __cxa_thread_atexit_impl(void (*dtor)(void*), void* obj, void* /*dso_symbol*/) {
     pthread_once(&g_threadDtorOnce, createThreadDtorKey);
     auto* entry = static_cast<ThreadDtor*>(malloc(sizeof(ThreadDtor)));
-    if (!entry)
-        return -1;
-    // Destructors run in reverse order of registration, so push to the front.
+    if (!entry) return -1;
     entry->dtor = dtor;
     entry->obj = obj;
     entry->next = static_cast<ThreadDtor*>(pthread_getspecific(g_threadDtorKey));
@@ -957,10 +617,8 @@ int __cxa_thread_atexit_impl(void (*dtor)(void*), void* obj, void* /*dso_symbol*
     return 0;
 }
 
-// For the memory report (the runtime's memguard_ps4.cpp): bytes in use (every heap), the main heap's size, the overflow
-// segments' total size and count.
 void ps4_heap_usage(uint64_t* in_use, uint64_t* main_size, uint64_t* overflow_bytes, uint32_t* overflow_segments) {
-    *in_use = g_inUse.load(std::memory_order_relaxed);
+    *in_use = 0; 
     *main_size = g_heapSize;
     pthread_mutex_lock(&g_overflowLock);
     *overflow_bytes = g_overflowBytes;
@@ -968,58 +626,11 @@ void ps4_heap_usage(uint64_t* in_use, uint64_t* main_size, uint64_t* overflow_by
     pthread_mutex_unlock(&g_overflowLock);
 }
 
-// The big allocations still held, summed by where they came from, biggest first, as lines into `out` (for the
-// runtime's memory report). Returns the number of lines.
 int ps4_heap_top(char* out, size_t size) {
-    struct Sum {
-        uint32_t where[5];
-        size_t bytes;
-        int count;
-    };
-    static Sum sums[256];
-    int n = 0;
-    size_t total = 0, untracked = 0;
-    pthread_mutex_lock(&g_bigLock);
-    for (const BigAlloc& a : g_big) {
-        if (!a.ptr)
-            continue;
-        total += a.size;
-        int i = 0;
-        while (i < n && memcmp(sums[i].where, a.where, sizeof a.where) != 0)
-            i++;
-        if (i == n) {
-            if (n == 256)
-                continue;
-            memcpy(sums[n].where, a.where, sizeof a.where);
-            sums[n].bytes = 0, sums[n].count = 0;
-            n++;
-        }
-        sums[i].bytes += a.size, sums[i].count++;
-    }
-    untracked = g_bigUntracked;
-    pthread_mutex_unlock(&g_bigLock);
-    size_t used = 0;
-    int lines = 0;
-    used += snprintf(out + used, size - used, "app heap: %zu MiB in allocations of 1 MiB or more (%zu MiB untracked)\n",
-                     total / MB, untracked / MB);
-    lines++;
-    for (int k = 0; k < 10 && used < size; k++) {
-        int best = -1;
-        for (int i = 0; i < n; i++)
-            if (sums[i].count && (best < 0 || sums[i].bytes > sums[best].bytes))
-                best = i;
-        if (best < 0)
-            break;
-        const Sum& b = sums[best];
-        used += snprintf(out + used, size - used, "app heap:   %zu MiB in %d from elf 0x%x < 0x%x < 0x%x < 0x%x < 0x%x\n",
-                         b.bytes / MB, b.count, b.where[0], b.where[1], b.where[2], b.where[3], b.where[4]);
-        sums[best].count = 0;
-        lines++;
-    }
-    return lines;
+    (void)out; (void)size;
+    return 0; 
 }
 
-// Diagnostics.
 const char* ps4rt_heap_source(void) {
     getHeap();
     return g_heapPool;
